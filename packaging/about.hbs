@@ -1,0 +1,22 @@
+Third-party software in Local AI Hub (hubd)
+==========================================
+
+hubd is built from the Rust crates listed below. Each is used under the licence shown; the full
+licence texts follow. SQLite (bundled through libsqlite3-sys) is in the public domain.
+The Windows binary is built with the mingw-w64 toolchain, whose statically linked runtime pieces
+are under the Zope Public License 2.1 and public-domain terms.
+The Colibri engine is NOT part of this download; when you add it, its own LICENSE, NOTICE and
+THIRD_PARTY_NOTICES.md apply. Model weights carry their own licences.
+
+{{#each overview}}
+- {{{name}}}: {{count}} crates
+{{/each}}
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}}
+Used by:{{#each used_by}} {{crate.name}} {{crate.version}}{{#unless @last}},{{/unless}}{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}

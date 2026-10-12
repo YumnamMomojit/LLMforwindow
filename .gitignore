@@ -4,3 +4,4 @@
 *.db-shm
 .env
 /third_party/colibri/
+/dist
