@@ -10,6 +10,7 @@ use crate::proc::OwnedChild;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -22,6 +23,9 @@ pub enum TunnelState {
     Failed(String),
 }
 
+/// Lines of the (redacted) cloudflared log carried in a `Failed` detail.
+const FAILURE_TAIL_LINES: usize = 5;
+
 /// Constructing this is the explicit authorization step to publish an endpoint.
 pub struct PublicSharingConsent(());
 impl PublicSharingConsent {
@@ -33,9 +37,13 @@ impl PublicSharingConsent {
 pub struct CloudflaredTunnel {
     pub exe: PathBuf,
     pub public_hostname: String,
-    child: Option<OwnedChild>,
+    /// Behind a Mutex so `state(&self)` can notice (and reap) a cloudflared that exited.
+    child: Mutex<Option<OwnedChild>>,
     state: Arc<Mutex<TunnelState>>,
     tail: Arc<Mutex<VecDeque<String>>>,
+    /// Bumped by every start and stop, so the log readers of an earlier connector cannot
+    /// change the state of a later one (or turn Off back into Connected).
+    run: Arc<AtomicU64>,
 }
 
 impl CloudflaredTunnel {
@@ -43,14 +51,43 @@ impl CloudflaredTunnel {
         Self {
             exe,
             public_hostname,
-            child: None,
+            child: Mutex::new(None),
             state: Arc::new(Mutex::new(TunnelState::Off)),
             tail: Default::default(),
+            run: Default::default(),
         }
     }
 
+    /// Current state. A connector that exited on its own (bad or revoked token, crash) is
+    /// reported as Failed here, with its exit status and the last lines of its log.
     pub fn state(&self) -> TunnelState {
+        let exited = {
+            let mut child = self.child.lock().unwrap();
+            let status = child.as_mut().and_then(|c| c.poll_exit());
+            if status.is_some() {
+                *child = None; // gone: start() may run again
+            }
+            status
+        };
+        if let Some(status) = exited {
+            let tail = self.log_tail();
+            let mut m = format!("cloudflared exited ({status})");
+            let last = &tail[tail.len().saturating_sub(FAILURE_TAIL_LINES)..];
+            if !last.is_empty() {
+                m.push_str("\nLast cloudflared log lines (redacted):");
+                for l in last {
+                    m.push_str("\n  ");
+                    m.push_str(l);
+                }
+            }
+            *self.state.lock().unwrap() = TunnelState::Failed(m);
+        }
         self.state.lock().unwrap().clone()
+    }
+
+    /// cloudflared's recent output with the token redacted, for diagnostics.
+    pub fn log_tail(&self) -> Vec<String> {
+        self.tail.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn public_base_url(&self) -> Option<String> {
@@ -63,8 +100,12 @@ impl CloudflaredTunnel {
         token: &str,
         _consent: &PublicSharingConsent,
     ) -> Result<(), String> {
-        if self.child.is_some() {
+        self.state(); // reaps a connector that already exited, so it does not block a restart
+        if self.child.get_mut().unwrap().is_some() {
             return Err("tunnel already running".into());
+        }
+        if token.trim().is_empty() {
+            return Err("the tunnel token is empty".into());
         }
         if !self.exe.is_file() {
             return Err(format!("cloudflared not found at {}", self.exe.display()));
@@ -77,6 +118,8 @@ impl CloudflaredTunnel {
             .stderr(std::process::Stdio::piped());
         let mut child =
             OwnedChild::spawn(&mut cmd).map_err(|e| format!("could not start cloudflared: {e}"))?;
+        let run = self.run.fetch_add(1, Ordering::SeqCst) + 1;
+        self.tail.lock().unwrap().clear();
         *self.state.lock().unwrap() = TunnelState::Connecting;
         for pipe in [
             child.child.stdout.take().map(|s| {
@@ -90,12 +133,19 @@ impl CloudflaredTunnel {
         .flatten()
         {
             let (state, tail, token) = (self.state.clone(), self.tail.clone(), token.to_string());
+            let current = self.run.clone();
             tokio::spawn(async move {
                 let mut lines = pipe.lines();
                 while let Ok(Some(l)) = lines.next_line().await {
+                    if current.load(Ordering::SeqCst) != run {
+                        break; // stopped or restarted since
+                    }
                     let l = l.replace(&token, "[redacted]");
                     if l.contains("Registered tunnel connection") {
-                        *state.lock().unwrap() = TunnelState::Connected;
+                        let mut s = state.lock().unwrap();
+                        if *s == TunnelState::Connecting {
+                            *s = TunnelState::Connected;
+                        }
                     }
                     let mut t = tail.lock().unwrap();
                     if t.len() >= 100 {
@@ -105,13 +155,15 @@ impl CloudflaredTunnel {
                 }
             });
         }
-        self.child = Some(child);
+        *self.child.get_mut().unwrap() = Some(child);
         Ok(())
     }
 
     /// "Stop Sharing": ends only the tunnel; local engine and gateway keep running.
     pub async fn stop(&mut self) {
-        if let Some(mut c) = self.child.take() {
+        self.run.fetch_add(1, Ordering::SeqCst);
+        let child = self.child.get_mut().unwrap().take();
+        if let Some(mut c) = child {
             c.kill_tree().await;
         }
         *self.state.lock().unwrap() = TunnelState::Off;

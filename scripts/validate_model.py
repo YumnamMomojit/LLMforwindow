@@ -19,9 +19,14 @@ def main():
         import family_registry as fr
         r = fr.resolve_model(sys.argv[2])
         d = r.descriptor
+        # FamilyDescriptor.modality: "text" for the chat engines, "image" (Qwen-Image) or
+        # "decision" (Laya, GLiNER2.5-Decide). The Hub accepts "text" only. Registries from
+        # before the field existed had chat families only, hence the default.
+        modality = getattr(d, "modality", "text")
         print(json.dumps({
             "ok": True, "family": d.id, "display_name": d.display_name,
-            "model_type": r.model_type, "modality": str(d.modality),
+            "model_type": r.model_type,
+            "modality": modality if isinstance(modality, str) else None,
             "tokenizer_file": d.tokenizer_file if isinstance(d.tokenizer_file, str) else None,
         }))
         return 0

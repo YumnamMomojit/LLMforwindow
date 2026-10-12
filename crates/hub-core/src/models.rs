@@ -11,6 +11,9 @@ pub struct ModelInfo {
     pub family: String,
     pub display_name: String,
     pub model_type: String,
+    /// The upstream family's modality: "text" (a chat engine), "image" or "decision".
+    /// Only "text" passes validation.
+    pub modality: String,
     pub weights_bytes: u64,
     pub has_tokenizer: bool,
     pub issues: Vec<String>,
@@ -24,13 +27,15 @@ pub struct ModelRecord {
     pub weights_bytes: u64,
 }
 
+/// 1-64 chars of [A-Za-z0-9._-], not starting with '.' or '-' (the id is an argv value for
+/// the launcher, and a leading '-' reads as an option there).
 pub fn valid_model_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-        && !id.starts_with('.')
+        && !id.starts_with(['.', '-'])
 }
 
 /// Pure-Rust structural checks: config, tokenizer, shard files named by the index, sizes.
@@ -107,12 +112,29 @@ pub async fn validate(
         .output()
         .await;
     let (mut family, mut display, mut mtype) = (String::new(), String::new(), String::new());
+    let mut modality = String::new();
     match out {
         Ok(o) => match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
             Ok(v) if v["ok"] == true => {
                 family = v["family"].as_str().unwrap_or("").into();
                 display = v["display_name"].as_str().unwrap_or("").into();
                 mtype = v["model_type"].as_str().unwrap_or("").into();
+                modality = v["modality"].as_str().unwrap_or("").into();
+                // The Hub serves /v1/chat/completions only. Upstream's decision engines
+                // (Laya, GLiNER2.5-Decide: POST /v1/systemone) and its image engine
+                // (Qwen-Image) resolve to a family too, but can never answer a chat.
+                match modality.as_str() {
+                    "text" => {}
+                    "" => issues.push(
+                        "the validator did not report the model's modality; check that \
+                         --colibri-dir is the pinned Colibri release"
+                            .into(),
+                    ),
+                    m => issues.push(format!(
+                        "{display} ({family}) is not a chat model (upstream modality \"{m}\"); \
+                         Local AI Hub serves text chat models only"
+                    )),
+                }
             }
             Ok(v) => issues.push(format!(
                 "not supported by the Colibri engine: {}",
@@ -129,6 +151,7 @@ pub async fn validate(
         family,
         display_name: display,
         model_type: mtype,
+        modality,
         weights_bytes: bytes,
         has_tokenizer: has_tok,
         issues,
@@ -137,7 +160,9 @@ pub async fn validate(
 
 pub fn register(c: &Connection, id: &str, path: &Path, info: &ModelInfo) -> anyhow::Result<()> {
     if !valid_model_id(id) {
-        anyhow::bail!("model id must be 1-64 chars of [A-Za-z0-9._-]");
+        anyhow::bail!(
+            "model id must be 1-64 chars of [A-Za-z0-9._-], not starting with '.' or '-'"
+        );
     }
     c.execute(
         "INSERT INTO models(id,path,model_type,weights_bytes,added_at) VALUES(?1,?2,?3,?4,?5)",
