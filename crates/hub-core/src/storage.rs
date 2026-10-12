@@ -3,7 +3,7 @@
 //! component and every existing ancestor is checked for symlinks / Windows reparse points
 //! (junctions) before use. Quotas and the free-space reserve are enforced WHILE writing.
 use crate::now;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -57,10 +57,70 @@ fn check_component(c: &str) -> R<()> {
     if RESERVED.contains(&stem.as_str()) {
         return bad("reserved device name");
     }
-    if c.starts_with(".tmp-") || c == ".tmp" {
+    // Compared the way NTFS compares names, so `.TMP-uploads` cannot reach the temp area.
+    let key = path_key(c);
+    if key.starts_with(".TMP-") || key == ".TMP" {
         return bad("reserved internal name");
     }
+    if looks_like_short_name(c) {
+        return bad("8.3 short-name alias");
+    }
     Ok(())
+}
+
+/// Path identity as NTFS sees it: case-insensitive, through a per-character upcase table
+/// (approximated by the one-to-one uppercase mappings). `a.txt` and `A.TXT` are one file
+/// there, so they must be one row here. Maps character to character (length is kept).
+fn path_key(rel: &str) -> String {
+    rel.chars()
+        .map(|ch| {
+            let mut up = ch.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(u), None) => u,
+                _ => ch, // e.g. 'ß' -> "SS": NTFS leaves such characters as they are
+            }
+        })
+        .collect()
+}
+
+/// `NAME~N.EXT` within 8.3 characters is how NTFS spells the short alias of a long name
+/// (`PROGRA~1`, `LONGFI~1.TXT`); it would reach that other file behind the database's back.
+fn looks_like_short_name(c: &str) -> bool {
+    let (base, ext) = c.split_once('.').unwrap_or((c, ""));
+    !ext.contains('.')
+        && base.chars().count() <= 8
+        && ext.chars().count() <= 3
+        && base
+            .split('~')
+            .skip(1)
+            .any(|t| t.starts_with(|ch: char| ch.is_ascii_digit()))
+}
+
+fn remove_if_exists(p: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// zip64 records only where needed, for the widest reader support. Deflate can grow
+/// incompressible data slightly, so switch well below the 4 GiB limit.
+const ZIP64_FROM: u64 = 1 << 31;
+
+/// A sibling name to build `dest` under, so `dest` only ever holds a finished file.
+fn part_path(dest: &Path) -> PathBuf {
+    let mut p = dest.as_os_str().to_owned();
+    p.push(format!(".{}.part", hex::encode(crate::random_bytes::<4>())));
+    PathBuf::from(p)
+}
+
+/// Rename a fully written `part` over `dest`, or remove it if writing failed.
+fn put_in_place(written: R<()>, part: &Path, dest: &Path) -> R<()> {
+    let res = written.and_then(|()| Ok(std::fs::rename(part, dest)?));
+    if res.is_err() {
+        let _ = std::fs::remove_file(part);
+    }
+    res
 }
 
 /// Split a user-supplied relative path ("a/b.txt" or "a\\b.txt") into safe components.
@@ -219,6 +279,27 @@ impl Workspaces {
         Ok(v)
     }
 
+    /// The tracked file `rel_norm` names, as `(id, stored rel_path, size)`. Matched by
+    /// [`path_key`], so every spelling NTFS treats as that file finds its one row.
+    fn find_file(&self, ws: &str, rel_norm: &str) -> R<Option<(i64, String, i64)>> {
+        let key = path_key(rel_norm);
+        // path_key keeps the length, so only rows of the same length can match; exact first.
+        let mut st = self.conn.prepare(
+            "SELECT id,rel_path,size FROM files WHERE ws_id=?1 AND length(rel_path)=?2 ORDER BY rel_path=?3 DESC",
+        )?;
+        let rows = st.query_map(
+            params![ws, rel_norm.chars().count() as i64, rel_norm],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        for row in rows {
+            let row: (i64, String, i64) = row?;
+            if path_key(&row.1) == key {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+
     /// Stream `data` into `<workspace>/<rel>`. `kind` is "import" or "output".
     pub fn write_file(
         &mut self,
@@ -230,20 +311,24 @@ impl Workspaces {
     ) -> R<FileRecord> {
         let info = self.info(ws)?;
         let wdir = self.ws_dir(ws)?;
-        let comps = sanitize_rel(rel)?;
-        let rel_norm = comps.join("/");
-        let existing: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT size FROM files WHERE ws_id=?1 AND rel_path=?2",
-                params![ws, rel_norm],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if existing.is_some() && !overwrite {
-            return Err(StorageError::Exists(rel_norm));
+        let mut comps = sanitize_rel(rel)?;
+        let mut rel_norm = comps.join("/");
+        let mut existing_size = 0;
+        if let Some((_, stored, size)) = self.find_file(ws, &rel_norm)? {
+            if !overwrite {
+                return Err(StorageError::Exists(stored));
+            }
+            // The same file under another spelling: keep the stored one, so row and disk stay 1:1.
+            comps = sanitize_rel(&stored)?;
+            rel_norm = stored;
+            existing_size = size;
         }
         let final_path = resolve_in(&wdir, &comps)?;
+        // Never replace a file the database does not know about (a leftover, or an alias
+        // the key cannot see) unless asked to.
+        if !overwrite && std::fs::symlink_metadata(&final_path).is_ok() {
+            return Err(StorageError::Exists(rel_norm));
+        }
         if let Some(parent) = final_path.parent() {
             std::fs::create_dir_all(parent)?;
             // re-verify after creation (a racing link would be caught here)
@@ -252,7 +337,7 @@ impl Workspaces {
         let tmpdir = wdir.join(".tmp-uploads");
         std::fs::create_dir_all(&tmpdir)?;
         let tmp = tmpdir.join(hex::encode(crate::random_bytes::<8>()));
-        let base_used = info.used_bytes.saturating_sub(existing.unwrap_or(0) as u64);
+        let base_used = info.used_bytes.saturating_sub(existing_size as u64);
         let quota = info.quota_bytes;
         let result = (|| -> R<(u64, String)> {
             let mut f = std::fs::OpenOptions::new()
@@ -291,14 +376,25 @@ impl Workspaces {
                 return Err(e);
             }
         };
-        std::fs::rename(&tmp, &final_path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
         let created = now();
-        self.conn.execute(
-            "INSERT INTO files(ws_id,rel_path,size,sha256,kind,created_at) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(ws_id,rel_path) DO UPDATE SET size=?3,sha256=?4,kind=?5,created_at=?6",
-            params![ws, rel_norm, size as i64, sha, kind, created])?;
+        // Row first, then the rename, committed together: a failed rename rolls the row
+        // back, and a failed row update never replaces the file on disk.
+        let committed = (|| -> R<()> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO files(ws_id,rel_path,size,sha256,kind,created_at) VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(ws_id,rel_path) DO UPDATE SET size=?3,sha256=?4,kind=?5,created_at=?6",
+                params![ws, rel_norm, size as i64, sha, kind, created])?;
+            std::fs::rename(&tmp, &final_path)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(e) = committed {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(FileRecord {
             rel_path: rel_norm,
             size,
@@ -311,16 +407,13 @@ impl Workspaces {
     pub fn read_file(&self, ws: &str, rel: &str) -> R<std::fs::File> {
         let wdir = self.ws_dir(ws)?;
         let comps = sanitize_rel(rel)?;
-        let known: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM files WHERE ws_id=?1 AND rel_path=?2",
-                params![ws, comps.join("/")],
-                |r| r.get(0),
-            )
-            .optional()?;
-        known.ok_or_else(|| StorageError::NotFound(rel.into()))?;
-        Ok(std::fs::File::open(resolve_in(&wdir, &comps)?)?)
+        let (_, stored, _) = self
+            .find_file(ws, &comps.join("/"))?
+            .ok_or_else(|| StorageError::NotFound(rel.into()))?;
+        Ok(std::fs::File::open(resolve_in(
+            &wdir,
+            &sanitize_rel(&stored)?,
+        )?)?)
     }
 
     pub fn delete_file(&self, ws: &str, rel: &str, confirmed: bool) -> R<()> {
@@ -329,79 +422,135 @@ impl Workspaces {
         }
         let wdir = self.ws_dir(ws)?;
         let comps = sanitize_rel(rel)?;
-        let p = resolve_in(&wdir, &comps)?;
-        let n = self.conn.execute(
-            "DELETE FROM files WHERE ws_id=?1 AND rel_path=?2",
-            params![ws, comps.join("/")],
-        )?;
-        if n == 0 {
-            return Err(StorageError::NotFound(rel.into()));
-        }
-        match std::fs::remove_file(p) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
+        let (id, stored, _) = self
+            .find_file(ws, &comps.join("/"))?
+            .ok_or_else(|| StorageError::NotFound(rel.into()))?;
+        let p = resolve_in(&wdir, &sanitize_rel(&stored)?)?;
+        // Disk first: if the removal fails, the row (and its quota use) stays and a retry works.
+        remove_if_exists(&p)?;
+        self.conn.execute("DELETE FROM files WHERE id=?1", [id])?;
+        Ok(())
     }
 
     /// Deletes the workspace folder and rows. Not a secure erase (SSD wear levelling).
+    /// Disk before rows: if a removal fails part-way (a file held open on Windows, a permission
+    /// error) the workspace stays, listing exactly the files still on disk, and can be deleted again.
     pub fn delete_workspace(&self, ws: &str, confirmed: bool) -> R<()> {
         if !confirmed {
             return Err(StorageError::NotConfirmed);
         }
         self.info(ws)?;
         let d = self.ws_dir(ws)?;
-        self.conn
-            .execute("DELETE FROM workspaces WHERE id=?1", [ws])?;
-        if d.exists() {
-            std::fs::remove_dir_all(d)?;
+        let mut removed = Vec::new();
+        let res = (|| -> R<()> {
+            for f in self.list_files(ws)? {
+                // A stored path that no longer validates or crosses a link is left to
+                // remove_dir_all, which removes links without following them.
+                if let Ok(p) = sanitize_rel(&f.rel_path).and_then(|c| resolve_in(&d, &c)) {
+                    remove_if_exists(&p)?;
+                    removed.push(f.rel_path);
+                }
+            }
+            if d.exists() {
+                std::fs::remove_dir_all(&d)?;
+            }
+            Ok(())
+        })();
+        let tx = self.conn.unchecked_transaction()?;
+        if res.is_ok() {
+            tx.execute("DELETE FROM workspaces WHERE id=?1", [ws])?;
+        } else {
+            for r in &removed {
+                tx.execute(
+                    "DELETE FROM files WHERE ws_id=?1 AND rel_path=?2",
+                    params![ws, r],
+                )?;
+            }
         }
-        Ok(())
+        tx.commit()?;
+        res
     }
 
     /// Export one workspace (files + metadata.json) to a zip. Never includes models or secrets.
+    /// Built under a temporary name and renamed into place, so a failed export leaves `dest` as it was.
     pub fn export_workspace(&self, ws: &str, dest: &Path) -> R<()> {
         let info = self.info(ws)?;
         let wdir = self.ws_dir(ws)?;
-        if dest.starts_with(&wdir) {
+        // Compare real locations, not spellings (`..`, links, relative paths, `\\?\` on
+        // Windows): nothing may be written under the workspaces root.
+        let name = dest
+            .file_name()
+            .ok_or_else(|| StorageError::InvalidPath(format!("export destination {dest:?}")))?;
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let dest = parent.canonicalize()?.join(name);
+        if dest.starts_with(&self.root) {
             return Err(StorageError::InvalidPath(
-                "export destination is inside the workspace".into(),
+                "export destination is inside the workspaces folder".into(),
             ));
         }
         let files = self.list_files(ws)?;
-        let out = std::fs::File::create(dest)?;
-        let mut z = zip::ZipWriter::new(out);
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        z.start_file("metadata.json", opts)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        z.write_all(
-            serde_json::to_string_pretty(&serde_json::json!({"workspace": info, "files": files}))
+        let part = part_path(&dest);
+        let written = (|| -> R<()> {
+            let out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part)?;
+            let mut z = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            z.start_file("metadata.json", opts)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            z.write_all(
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"workspace": info, "files": files}),
+                )
                 .unwrap()
                 .as_bytes(),
-        )?;
-        for f in &files {
-            let comps = sanitize_rel(&f.rel_path)?;
-            let p = resolve_in(&wdir, &comps)?;
-            z.start_file(format!("files/{}", f.rel_path), opts)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            std::io::copy(&mut std::fs::File::open(p)?, &mut z)?;
-        }
-        z.finish()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(())
+            )?;
+            for f in &files {
+                let comps = sanitize_rel(&f.rel_path)?;
+                let mut src = std::fs::File::open(resolve_in(&wdir, &comps)?)?;
+                let large = src.metadata()?.len() >= ZIP64_FROM;
+                z.start_file(format!("files/{}", f.rel_path), opts.large_file(large))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                std::io::copy(&mut src, &mut z)?;
+            }
+            z.finish()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .sync_all()?;
+            Ok(())
+        })();
+        put_in_place(written, &part, &dest)
     }
 
     /// Consistent database snapshot (VACUUM INTO, not a file copy). API-key verifiers excluded.
+    /// Snapshot and redaction happen under a temporary name: `dest` only ever holds the redacted copy.
     pub fn backup_database(&self, dest: &Path) -> R<()> {
         if dest.exists() {
             return Err(StorageError::Exists(dest.display().to_string()));
         }
-        self.conn
-            .execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
-        let b = Connection::open(dest)?;
-        b.execute("DELETE FROM api_keys", [])?;
-        b.execute("DELETE FROM request_log", [])?;
-        b.execute_batch("VACUUM")?;
-        Ok(())
+        let part = part_path(dest);
+        let written = (|| -> R<()> {
+            self.conn
+                .execute("VACUUM INTO ?1", [part.to_string_lossy().as_ref()])?;
+            let b = Connection::open(&part)?;
+            b.execute("DELETE FROM api_keys", [])?;
+            b.execute("DELETE FROM request_log", [])?;
+            b.execute_batch("VACUUM")?;
+            // Closing checkpoints any -wal into the file before it is renamed.
+            b.close().map_err(|(_, e)| e)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            for sidecar in ["-wal", "-shm", "-journal"] {
+                let mut s = part.as_os_str().to_owned();
+                s.push(sidecar);
+                let _ = std::fs::remove_file(s);
+            }
+        }
+        put_in_place(written, &part, dest)
     }
 }
