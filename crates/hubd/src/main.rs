@@ -1,4 +1,5 @@
 //! hubd - headless Local AI Hub service/CLI. The desktop shell calls the same hub-core APIs.
+mod local;
 use anyhow::{anyhow, bail, Context, Result};
 use hub_core::engine::{ColibriAdapter, ColibriConfig, EngineState, InferenceAdapter};
 use hub_core::gateway::{Gateway, GatewayConfig};
@@ -23,6 +24,13 @@ USAGE: hubd [--data-dir DIR] <command>
   serve --model ID [--colibri-dir C] [--python P] [--port N] [--max-active N]
         [--startup-timeout SECS] [--share --cloudflared EXE --hostname H --i-authorize-public-sharing]
   purge                                  apply history/log retention
+  chat [--model ID] [--system TEXT] [--max-tokens N] [--no-history] [--url http://127.0.0.1:8787/v1]
+                                         terminal chat with the running local API (key from $HUB_API_KEY or prompt)
+  history status | on | off | retention <days|none> | list | show <id> | delete <id> --yes
+  workspace list | create <name> [--quota-mb N] | files <ws>
+  workspace put <ws> <file> [--as REL] [--overwrite] | get <ws> <rel> <dest> [--overwrite]
+  workspace rm <ws> <rel> --yes | delete <ws> --yes | export <ws> <dest.zip>
+  backup <dest.db>                       consistent database snapshot (no keys, no request log)
   help | --help | -h                     show this text and do nothing else
 
 --colibri-dir defaults to $HUB_COLIBRI_DIR; --python to $HUB_PYTHON, else python3 (python.exe) on PATH.
@@ -240,7 +248,18 @@ fn fmt_time(t: Option<i64>) -> String {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // The cause chain on one line; never a backtrace, whatever RUST_BACKTRACE says.
+            say_err!("Error: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     // Help wins wherever it appears and has no side effects (`purge --help` must not purge).
     if raw.is_empty() || raw[0] == "help" || raw.iter().any(|a| a == "--help" || a == "-h") {
@@ -451,6 +470,10 @@ async fn main() -> Result<()> {
                 history::purge_request_log(&c, 30)?
             );
         }
+        "workspace" => local::workspace(&dir, args)?,
+        "history" => local::history_cmd(&dir, args)?,
+        "backup" => local::backup(&dir, args)?,
+        "chat" => local::chat(&dir, args).await?,
         "serve" => {
             let opts = ServeOpts::parse(args)?;
             serve(&dir, &db_path, opts).await?

@@ -92,8 +92,11 @@ fn actionable(tail: &str) -> Option<&'static str> {
     if t.contains("load_fail kind=nomem")
         || t.contains("memoryerror")
         || t.contains("cannot allocate")
+        || t.contains("ram budget cannot hold")
     {
-        Some("Not enough memory to load this model. Close other applications or choose a smaller model.")
+        Some("Not enough memory to load this model. Close other applications or choose a smaller model. \
+              If memory is actually free, set RAM_GB=<gigabytes> before `hubd serve` to tell the engine's \
+              planner how much RAM to use.")
     } else if port_in_use(&t) {
         Some("The engine port is already in use. Pick another port or stop the program using it.")
     } else if t.contains("kind=format") || t.contains("kind=unsupported") {

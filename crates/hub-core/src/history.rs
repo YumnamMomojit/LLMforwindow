@@ -69,6 +69,35 @@ pub fn append(c: &mut Connection, conv: &str, role: &str, content: &str) -> anyh
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct Conversation {
+    pub id: String,
+    pub title: String,
+    pub model: Option<String>,
+    pub updated_at: i64,
+    pub messages: i64,
+}
+
+/// Newest first.
+pub fn list_conversations(c: &Connection) -> anyhow::Result<Vec<Conversation>> {
+    let v = c
+        .prepare(
+            "SELECT c.id,c.title,c.model,c.updated_at,COUNT(m.id) FROM conversations c
+             LEFT JOIN messages m ON m.conv_id=c.id GROUP BY c.id ORDER BY c.updated_at DESC, c.id",
+        )?
+        .query_map([], |r| {
+            Ok(Conversation {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                model: r.get(2)?,
+                updated_at: r.get(3)?,
+                messages: r.get(4)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(v)
+}
+
 pub fn messages(c: &Connection, conv: &str) -> anyhow::Result<Vec<Message>> {
     let v = c
         .prepare("SELECT role,content,created_at FROM messages WHERE conv_id=?1 ORDER BY id")?

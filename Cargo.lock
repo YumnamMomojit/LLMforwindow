@@ -474,9 +474,12 @@ name = "hubd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "hub-core",
+ "reqwest",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]
