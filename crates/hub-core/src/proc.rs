@@ -1,9 +1,9 @@
 //! Owned process trees. Windows: Job Object with KILL_ON_JOB_CLOSE (children and
-//! grandchildren die with the job, only ours are affected). Unix: a dedicated process group;
-//! on Linux the direct child also gets PR_SET_PDEATHSIG(SIGKILL), so it dies with hubd even
-//! when hubd is killed without running its cleanup (its own children then see their pipes
-//! close). Other Unixes have no such backstop: there the tree outlives a hubd that dies
-//! without calling `kill_tree`.
+//! grandchildren die with the job, only ours are affected). Unix: a dedicated process group,
+//! SIGKILLed when the `OwnedChild` is dropped unreaped; on Linux the direct child also gets
+//! PR_SET_PDEATHSIG(SIGKILL), so it dies with hubd even when hubd is killed without running
+//! its cleanup (its own children then see their pipes close). Other Unixes have no such
+//! backstop: there the tree outlives a hubd that dies without calling `kill_tree`.
 //! Known gap (Windows): a grandchild spawned before the job assignment would escape; the
 //! launcher is Python and spawns the engine seconds later, so the window is not exploitable
 //! in practice, but it is not a guarantee. Not exercised on a real Windows host yet.
@@ -77,6 +77,36 @@ impl OwnedChild {
         Some(status)
     }
 
+    /// Live processes in the tree, the direct child included: the members of its process
+    /// group (Linux) or of its job (Windows). None where they cannot be counted: other Unixes,
+    /// a direct child already reaped (Linux), or a failed query. A process that leaves the
+    /// group or job on its own (a new session, a breakaway) is not counted.
+    pub fn live_processes(&self) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            group_members(self.child.id()?)
+        }
+        #[cfg(windows)]
+        {
+            self.job.active_processes()
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        None
+    }
+
+    /// SIGKILL the whole tree (Windows: terminate the job) without waiting. The direct child
+    /// is left for `poll_exit` or `kill_tree` to reap.
+    pub fn kill_tree_now(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.child.id() {
+            unsafe {
+                libc::killpg(pgid as i32, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        self.job.terminate();
+    }
+
     /// Terminate the whole tree and reap the direct child.
     pub async fn kill_tree(&mut self) {
         #[cfg(unix)]
@@ -84,13 +114,13 @@ impl OwnedChild {
             unsafe {
                 libc::killpg(pid as i32, libc::SIGTERM);
             }
-            if tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait())
-                .await
-                .is_err()
-            {
-                unsafe {
-                    libc::killpg(pid as i32, libc::SIGKILL);
-                }
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
+            // Whatever is left gets SIGKILL: all of it after the timeout, and a grandchild
+            // that ignores SIGTERM even when the direct child exited on it. The group id
+            // stays taken while any member is alive; if none is, this is ESRCH.
+            unsafe {
+                libc::killpg(pid as i32, libc::SIGKILL);
             }
         }
         #[cfg(windows)]
@@ -98,6 +128,55 @@ impl OwnedChild {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
+}
+
+/// Dropping the owner of a tree that was not reaped kills the whole tree, as closing the job
+/// does on Windows, so a cancelled `kill_tree` or a replaced child cannot leave grandchildren
+/// running (tokio's kill_on_drop only kills the direct child).
+#[cfg(unix)]
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.kill_tree_now();
+    }
+}
+
+/// Processes of the group `pgid` that are alive (not zombies), from /proc. None on any error
+/// other than a process gone since the listing (out of file descriptors, say): a count that
+/// is too low would read as a dead engine.
+#[cfg(target_os = "linux")]
+fn group_members(pgid: u32) -> Option<usize> {
+    let mut n = 0;
+    for e in std::fs::read_dir("/proc").ok()? {
+        let name = e.ok()?.file_name();
+        let Some(pid) = name
+            .to_str()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(_) => return None,
+        };
+        // "pid (comm) state ppid pgrp ...": comm may hold spaces and ')'.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut f = rest.split_ascii_whitespace();
+        let (state, _ppid, pgrp) = (f.next(), f.next(), f.next());
+        if pgrp.and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
+            && !matches!(state, Some("Z" | "X" | "x"))
+        {
+            n += 1;
+        }
+    }
+    Some(n)
 }
 
 #[cfg(windows)]
@@ -141,6 +220,20 @@ mod win {
         pub fn terminate(&self) {
             unsafe {
                 TerminateJobObject(self.0, 1);
+            }
+        }
+        /// Processes in the job now (nested jobs included).
+        pub fn active_processes(&self) -> Option<usize> {
+            unsafe {
+                let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+                let ok = QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicAccountingInformation,
+                    &mut info as *mut _ as *mut _,
+                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                );
+                (ok != 0).then_some(info.ActiveProcesses as usize)
             }
         }
     }

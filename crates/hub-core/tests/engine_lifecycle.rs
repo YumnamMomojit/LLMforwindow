@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 
 const KEY: &str = "internal-test-key-0123456789";
 
-/// FAKE_MODE (read from <state>/mode): ok | die_after_ready | silent | busy_once.
+/// FAKE_MODE (read from <state>/mode): ok | die_after_ready | silent | busy_once |
+/// engine_child (runs an engine process, as upstream does, and serves) | stubborn (launcher
+/// and engine survive SIGTERM, never ready). The last two write "<launcher> <engine>" pids
+/// to <state>/pids once the engine runs.
 const FAKE_LAUNCHER: &str = r#"
-import argparse, json, os, sys, threading, time
+import argparse, json, os, signal, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 p = argparse.ArgumentParser()
 for f in ("--model", "--host", "--model-id", "--max-tokens", "--engine"):
@@ -19,6 +22,20 @@ p.add_argument("--port", type=int)
 a = p.parse_args()
 state = os.environ["FAKE_STATE"]
 mode = open(os.path.join(state, "mode")).read().strip()
+if mode == "stubborn":
+    signal.signal(signal.SIGTERM, lambda *_: open(os.path.join(state, "term"), "a").write("x"))
+if mode in ("engine_child", "stubborn"):
+    ready = os.path.join(state, "engine_up")
+    engine = subprocess.Popen([sys.executable, "-c",
+        "import signal, sys, time\n"
+        "if sys.argv[1] == 'stubborn': signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open(sys.argv[2], 'w').close()\n"
+        "time.sleep(600)", mode, ready])
+    while not os.path.exists(ready):
+        time.sleep(0.01)
+    with open(os.path.join(state, "pids.tmp"), "w") as f:
+        f.write(f"{os.getpid()} {engine.pid}")
+    os.replace(os.path.join(state, "pids.tmp"), os.path.join(state, "pids"))
 with open(os.path.join(state, "launches"), "a") as f:
     f.write(a.model_id + "\n")
 launches = len(open(os.path.join(state, "launches")).read().split())
@@ -56,6 +73,9 @@ class H(BaseHTTPRequestHandler):
 
 srv = HTTPServer((a.host, a.port), H)
 print(f"loading with key {key}", file=sys.stderr, flush=True)
+if mode == "stubborn":
+    while True:
+        time.sleep(1)
 if mode != "silent":
     print(f"OpenAI-compatible API listening on http://{a.host}:{a.port}/v1", file=sys.stderr, flush=True)
 srv.serve_forever()
@@ -169,6 +189,127 @@ async fn exit_after_ready_is_reported_as_failed() {
     assert!(matches!(e.state(), EngineState::Failed(_)));
     e.stop().await;
     assert_eq!(e.state(), EngineState::NotConfigured);
+}
+
+/// Gone, or a zombie nobody reaped yet: dead.
+#[cfg(target_os = "linux")]
+fn alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => false,
+        Ok(s) => !matches!(
+            s.rsplit_once(')')
+                .and_then(|(_, r)| r.trim_start().chars().next()),
+            Some('Z' | 'X')
+        ),
+    }
+}
+
+/// (launcher, engine) pids written by the engine_child and stubborn modes.
+#[cfg(target_os = "linux")]
+fn tree_pids(state: &Path) -> Option<(u32, u32)> {
+    let s = std::fs::read_to_string(state.join("pids")).ok()?;
+    let mut p = s.split_whitespace().map(|p| p.parse().unwrap());
+    Some((p.next()?, p.next()?))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_dead(pids: &[u32]) {
+    let t0 = Instant::now();
+    while pids.iter().any(|&p| alive(p)) && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let left: Vec<_> = pids.iter().filter(|&&p| alive(p)).collect();
+    for &&p in &left {
+        unsafe {
+            libc::kill(p as i32, libc::SIGKILL);
+        }
+    }
+    assert!(left.is_empty(), "engine processes survived: {left:?}");
+}
+
+/// Upstream's launcher outlives its engine: when the engine is OOM-killed or crashes, it
+/// keeps answering /v1/models. That must still be reported, and the launcher stopped.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn engine_exit_after_ready_is_reported_while_the_launcher_lives() {
+    let Some(py) = python3() else {
+        eprintln!("skipped: python3 not on PATH");
+        return;
+    };
+    let f = fixture("engine_child");
+    let mut e = ColibriAdapter::new(config(
+        py,
+        f.colibri.clone(),
+        f.model.clone(),
+        Duration::from_secs(30),
+    ));
+    e.start().await.unwrap();
+    let (launcher, engine) = tree_pids(&f.state).expect("no pids from the fake launcher");
+    // A whole tree stays Ready.
+    for _ in 0..10 {
+        assert_eq!(e.state(), EngineState::Ready);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(e.health().await);
+    unsafe {
+        libc::kill(engine as i32, libc::SIGKILL);
+    }
+    let t0 = Instant::now();
+    let msg = loop {
+        if let EngineState::Failed(m) = e.state() {
+            break m;
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            unsafe {
+                libc::kill(launcher as i32, libc::SIGKILL);
+            }
+            panic!("engine exit after Ready never reported: {:?}", e.state());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(msg.contains("exited unexpectedly"), "{msg}");
+    assert!(!msg.contains(KEY), "internal key leaked: {msg}");
+    assert_eq!(e.upstream_url(), None);
+    assert!(!e.health().await);
+    // The launcher, useless without its engine, is stopped at once, not at stop().
+    wait_dead(&[launcher, engine]).await;
+    e.stop().await;
+    assert_eq!(e.state(), EngineState::NotConfigured);
+}
+
+/// hubd races start() against a stop request; one that lands while the startup-timeout kill
+/// is waiting for SIGTERM to work drops start() mid-kill. stop() must still end the tree.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stop_after_start_was_dropped_mid_teardown_ends_the_tree() {
+    let Some(py) = python3() else {
+        eprintln!("skipped: python3 not on PATH");
+        return;
+    };
+    let f = fixture("stubborn");
+    let mut e = ColibriAdapter::new(config(
+        py,
+        f.colibri.clone(),
+        f.model.clone(),
+        Duration::from_secs(2),
+    ));
+    {
+        let start = e.start();
+        tokio::pin!(start);
+        let t0 = Instant::now();
+        // Until the launcher got the startup-timeout SIGTERM: kill_tree then waits up to 5 s.
+        while !(f.state.join("term").exists() && tree_pids(&f.state).is_some()) {
+            tokio::select! {
+                r = &mut start => panic!("start() ended before it was dropped: {r:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "no startup timeout");
+        }
+    }
+    let (launcher, engine) = tree_pids(&f.state).expect("no pids from the fake launcher");
+    e.stop().await;
+    assert_eq!(e.state(), EngineState::NotConfigured);
+    wait_dead(&[launcher, engine]).await;
 }
 
 #[tokio::test]

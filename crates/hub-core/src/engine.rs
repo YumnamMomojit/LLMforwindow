@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -71,6 +71,10 @@ pub struct ColibriAdapter {
     /// soon as the child is known to be gone, so the internal key is not sent to a port that
     /// something else may own.
     port: AtomicU16,
+    /// Live processes in the engine tree (launcher, engine) when it became Ready; 0 when not
+    /// known. Fewer later means a process of the tree died: upstream's launcher outlives its
+    /// engine and keeps answering /v1/models, so its own exit cannot be waited for.
+    ready_tree: AtomicUsize,
     log_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -148,6 +152,7 @@ impl ColibriAdapter {
             state: Arc::new(Mutex::new(EngineState::NotConfigured)),
             child: Mutex::new(None),
             port: AtomicU16::new(0),
+            ready_tree: AtomicUsize::new(0),
             log_tail: Default::default(),
         }
     }
@@ -172,11 +177,15 @@ impl ColibriAdapter {
     }
 
     /// Detail for an engine process that exited: the actionable reason (or `fallback`), the
-    /// exit status and the last lines of the redacted log, so the operator sees why.
-    fn exit_detail(&self, fallback: &str, status: ExitStatus) -> String {
+    /// exit status when it is ours to know and the last lines of the redacted log, so the
+    /// operator sees why.
+    fn exit_detail(&self, fallback: &str, status: Option<ExitStatus>) -> String {
         let tail = self.log_tail();
         let reason = actionable(&tail.join("\n")).unwrap_or(fallback);
-        let mut m = format!("{reason} (exit status {status})");
+        let mut m = reason.to_string();
+        if let Some(status) = status {
+            m.push_str(&format!(" (exit status {status})"));
+        }
         let last = &tail[tail.len().saturating_sub(FAILURE_TAIL_LINES)..];
         if !last.is_empty() {
             m.push_str("\nLast engine log lines (redacted):");
@@ -222,6 +231,7 @@ impl InferenceAdapter for ColibriAdapter {
         }
         self.set(EngineState::Starting);
         self.port.store(0, Ordering::SeqCst);
+        self.ready_tree.store(0, Ordering::SeqCst);
         let colibri_dir = absolute(&self.cfg.colibri_dir);
         let p = LaunchPaths {
             python: absolute(&self.cfg.python),
@@ -263,11 +273,14 @@ impl InferenceAdapter for ColibriAdapter {
 
     async fn stop(&mut self) {
         self.set(EngineState::Stopping);
-        let child = self.child.get_mut().unwrap().take();
-        if let Some(mut c) = child {
+        self.port.store(0, Ordering::SeqCst);
+        self.ready_tree.store(0, Ordering::SeqCst);
+        // The child stays in place until it is reaped, so a stop that is itself interrupted
+        // leaves it to the next stop (or to the drop, which kills the tree).
+        if let Some(c) = self.child.get_mut().unwrap().as_mut() {
             c.kill_tree().await;
         }
-        self.port.store(0, Ordering::SeqCst);
+        *self.child.get_mut().unwrap() = None;
         self.set(EngineState::NotConfigured);
     }
 
@@ -276,14 +289,29 @@ impl InferenceAdapter for ColibriAdapter {
         if cur != EngineState::Ready {
             return cur;
         }
-        // Reflect an unexpected exit after Ready. tokio's Child::id() stays Some until the
-        // child is waited on, so only polling it (which also reaps) can tell.
-        let exited = self
-            .child
-            .lock()
-            .unwrap()
-            .as_mut()
-            .and_then(|c| c.poll_exit());
+        // Reflect an unexpected exit after Ready, of the launcher or of a process it started
+        // (the engine itself, which an out-of-memory kill or a crash usually hits; upstream's
+        // launcher then stays up and answers /v1/models, so a probe cannot tell). tokio's
+        // Child::id() stays Some until the child is waited on, so only polling it (which also
+        // reaps) can tell the launcher is gone.
+        let exited = {
+            let mut child = self.child.lock().unwrap();
+            let Some(c) = child.as_mut() else {
+                return cur;
+            };
+            if let Some(status) = c.poll_exit() {
+                Some(Some(status))
+            } else if c
+                .live_processes()
+                .is_some_and(|n| n < self.ready_tree.load(Ordering::SeqCst))
+            {
+                // A launcher without its engine answers nothing useful: stop the rest now.
+                c.kill_tree_now();
+                Some(None)
+            } else {
+                None
+            }
+        };
         let Some(status) = exited else {
             return cur;
         };
@@ -405,7 +433,7 @@ impl ColibriAdapter {
                 tokio::time::sleep(Duration::from_millis(200)).await; // let readers drain
                 *self.child.get_mut().unwrap() = None;
                 let in_use = port_in_use(&self.log_tail().join("\n").to_ascii_lowercase());
-                let m = self.exit_detail("The engine exited during startup.", status);
+                let m = self.exit_detail("The engine exited during startup.", Some(status));
                 return Err((m, in_use));
             }
             if listening.load(Ordering::SeqCst) {
@@ -420,6 +448,12 @@ impl ColibriAdapter {
                             if v["data"].as_array().is_some_and(|a| {
                                 a.iter().any(|m| m["id"] == self.cfg.model_id.as_str())
                             }) {
+                                // Upstream prints the banner only once its engine is up, and
+                                // nothing else runs in the tree then: this is the tree that
+                                // must stay whole.
+                                let tree = self.child.get_mut().unwrap().as_ref();
+                                let tree = tree.and_then(|c| c.live_processes()).unwrap_or(0);
+                                self.ready_tree.store(tree, Ordering::SeqCst);
                                 self.port.store(port, Ordering::SeqCst);
                                 self.set(EngineState::Ready);
                                 return Ok(());
@@ -429,9 +463,12 @@ impl ColibriAdapter {
                 }
             }
             if t0.elapsed() > self.cfg.startup_timeout {
-                if let Some(mut c) = self.child.get_mut().unwrap().take() {
+                // Killed in place: if start() is cancelled during the kill (a stop request
+                // races it), stop() still finds the tree.
+                if let Some(c) = self.child.get_mut().unwrap().as_mut() {
                     c.kill_tree().await;
                 }
+                *self.child.get_mut().unwrap() = None;
                 return Err((format!("The engine did not become ready within {} s. Large models can take longer; raise the startup timeout.", self.cfg.startup_timeout.as_secs()), false));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
