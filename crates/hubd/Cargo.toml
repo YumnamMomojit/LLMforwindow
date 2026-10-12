@@ -1,0 +1,11 @@
+[package]
+name = "hubd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hub-core = { path = "../hub-core" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

@@ -1,0 +1,158 @@
+//! Integration API keys. Format: `lah_<8 hex id>_<43 char base64url secret>`.
+//! Only SHA-256(secret) is stored (secrets are 256-bit random, so a fast hash is adequate);
+//! the secret is shown once at creation. Keys carry scopes; the only scope is `inference`.
+//! No key can reach administration, files, history, model downloads or process control:
+//! those surfaces do not exist on the public gateway at all.
+use crate::{now, random_bytes};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+pub const SCOPE_INFERENCE: &str = "inference";
+const PREFIX: &str = "lah_";
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KeyRecord {
+    pub id: String,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthError {
+    Missing,
+    Invalid,
+    Revoked,
+    Expired,
+    Forbidden,
+}
+
+fn verifier(secret: &str) -> String {
+    hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+/// Returns the record and the full token (the only time it exists in plaintext).
+pub fn create(
+    c: &Connection,
+    name: &str,
+    expires_at: Option<i64>,
+) -> anyhow::Result<(KeyRecord, String)> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 80 || name.chars().any(|ch| ch.is_control()) {
+        anyhow::bail!("key name must be 1-80 printable characters");
+    }
+    let id = hex::encode(random_bytes::<4>());
+    let secret = URL_SAFE_NO_PAD.encode(random_bytes::<32>());
+    let created = now();
+    c.execute(
+        "INSERT INTO api_keys(id,name,verifier,scopes,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![id, name, verifier(&secret), SCOPE_INFERENCE, created, expires_at],
+    )?;
+    let rec = get(c, &id)?.expect("just inserted");
+    Ok((rec, format!("{PREFIX}{id}_{secret}")))
+}
+
+fn row(r: &rusqlite::Row) -> rusqlite::Result<KeyRecord> {
+    let scopes: String = r.get(2)?;
+    Ok(KeyRecord {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        scopes: scopes.split(',').map(str::to_string).collect(),
+        created_at: r.get(3)?,
+        expires_at: r.get(4)?,
+        revoked_at: r.get(5)?,
+        last_used_at: r.get(6)?,
+    })
+}
+const COLS: &str = "id,name,scopes,created_at,expires_at,revoked_at,last_used_at";
+
+pub fn get(c: &Connection, id: &str) -> anyhow::Result<Option<KeyRecord>> {
+    Ok(c.query_row(
+        &format!("SELECT {COLS} FROM api_keys WHERE id=?1"),
+        [id],
+        row,
+    )
+    .optional()?)
+}
+
+pub fn list(c: &Connection) -> anyhow::Result<Vec<KeyRecord>> {
+    let mut s = c.prepare(&format!("SELECT {COLS} FROM api_keys ORDER BY created_at"))?;
+    let v = s.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(v)
+}
+
+pub fn revoke(c: &Connection, id: &str) -> anyhow::Result<bool> {
+    Ok(c.execute(
+        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1 AND revoked_at IS NULL",
+        params![id, now()],
+    )? > 0)
+}
+
+/// Issue a replacement with the same name; the old key keeps working for `grace_secs`.
+pub fn rotate(c: &Connection, id: &str, grace_secs: i64) -> anyhow::Result<(KeyRecord, String)> {
+    let old = get(c, id)?.ok_or_else(|| anyhow::anyhow!("no such key"))?;
+    if old.revoked_at.is_some() {
+        anyhow::bail!("key is already revoked");
+    }
+    let (rec, tok) = create(c, &old.name, old.expires_at)?;
+    let until = now() + grace_secs.max(0);
+    let new_exp = old.expires_at.map_or(until, |e| e.min(until));
+    c.execute(
+        "UPDATE api_keys SET expires_at=?2 WHERE id=?1",
+        params![id, new_exp],
+    )?;
+    Ok((rec, tok))
+}
+
+/// Verify an `Authorization` header value. `required_scope` is checked after authentication.
+pub fn verify(
+    c: &Connection,
+    header: Option<&str>,
+    required_scope: &str,
+) -> Result<KeyRecord, AuthError> {
+    let token = header
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .ok_or(AuthError::Missing)?;
+    let rest = token.strip_prefix(PREFIX).ok_or(AuthError::Invalid)?;
+    if rest.len() < 10 || rest.as_bytes()[8] != b'_' || !rest.is_char_boundary(8) {
+        return Err(AuthError::Invalid);
+    }
+    let (id, secret) = (&rest[..8], &rest[9..]);
+    let stored: Option<String> = c
+        .query_row("SELECT verifier FROM api_keys WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|_| AuthError::Invalid)?;
+    // Always hash, so unknown ids and wrong secrets cost the same.
+    let got = verifier(secret);
+    let want = stored.clone().unwrap_or_else(|| "0".repeat(64));
+    let ok: bool = got.as_bytes().ct_eq(want.as_bytes()).into();
+    if stored.is_none() || !ok {
+        return Err(AuthError::Invalid);
+    }
+    let rec = get(c, id).ok().flatten().ok_or(AuthError::Invalid)?;
+    if rec.revoked_at.is_some() {
+        return Err(AuthError::Revoked);
+    }
+    if rec.expires_at.is_some_and(|e| e <= now()) {
+        return Err(AuthError::Expired);
+    }
+    if !rec.scopes.iter().any(|s| s == required_scope) {
+        return Err(AuthError::Forbidden);
+    }
+    let _ = c.execute(
+        "UPDATE api_keys SET last_used_at=?2 WHERE id=?1",
+        params![id, now()],
+    );
+    Ok(rec)
+}

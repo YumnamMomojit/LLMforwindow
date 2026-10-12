@@ -1,0 +1,8 @@
+Local AI Hub
+Copyright 2026 contributors. Licensed under the Apache License 2.0 (see LICENSE).
+
+Local AI Hub is an independent application. It is not an official release of colibri.
+It drives the unmodified colibri engine (https://github.com/JustVugg/colibri, Apache-2.0,
+Copyright 2026 Vincenzo Fornaro; pinned in docs/UPSTREAM.md). Redistributed colibri files must
+carry colibri's LICENSE, NOTICE and THIRD_PARTY_NOTICES.md. Model weights are licensed by their own
+authors, separately from the engine.

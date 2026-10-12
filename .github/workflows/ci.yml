@@ -1,0 +1,25 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+  real-engine-fixture:   # real upstream engine + random-weight fixture; Linux only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install numpy pillow openai
+      - run: |
+          git clone --depth 1 --branch v2.0.0 https://github.com/JustVugg/colibri "$RUNNER_TEMP/colibri"
+          test "$(git -C $RUNNER_TEMP/colibri rev-parse HEAD)" = "bf2442915d6e3dd4cdfd2eb9c2a3d2aa44a25850"
+          COLIBRI_DIR=$RUNNER_TEMP/colibri scripts/e2e_real_fixture.sh
