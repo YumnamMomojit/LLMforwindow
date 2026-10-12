@@ -727,6 +727,218 @@ async fn trickled_request_body_times_out() {
     assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
 }
 
+/// Reads until the server closes the connection (EOF or reset) or nothing arrives for
+/// `quiet`. Returns what arrived and whether the server closed the connection.
+async fn read_until_closed(
+    s: &mut (impl tokio::io::AsyncRead + Unpin),
+    quiet: Duration,
+) -> (Vec<u8>, bool) {
+    use tokio::io::AsyncReadExt;
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        match tokio::time::timeout(quiet, s.read(&mut buf)).await {
+            Err(_) => return (got, false),
+            Ok(Ok(0)) | Ok(Err(_)) => return (got, true),
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+/// A raw client with a tiny receive buffer that starts an endless stream and never reads.
+async fn stalled_flood_client(e: &Env) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let body = chat("flood", true).to_string();
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut s = sock.connect(e.gw.addr).await.unwrap();
+    s.write_all(format!("{}{body}", raw_head(e, body.len())).as_bytes())
+        .await
+        .unwrap();
+    s
+}
+
+async fn models_ok(e: &Env) -> bool {
+    client()
+        .get(format!("{}/v1/models", e.base))
+        .bearer_auth(&e.token)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok_and(|r| r.status() == 200)
+}
+
+#[tokio::test]
+async fn silent_trickling_and_idle_connections_are_closed() {
+    use tokio::io::AsyncWriteExt;
+    let e = setup(|c| c.header_read_timeout_secs = 1).await;
+    // connects and never sends a byte
+    let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let t0 = Instant::now();
+    let (got, closed) = read_until_closed(&mut s, Duration::from_secs(5)).await;
+    assert!(closed, "a silent connection stayed open");
+    assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
+    let took = t0.elapsed();
+    assert!(
+        took > Duration::from_millis(500) && took < Duration::from_secs(4),
+        "{took:?}"
+    );
+    // trickles a request head one byte every 200 ms, which never completes it in time
+    let (mut rd, mut wr) = tokio::net::TcpStream::connect(e.gw.addr)
+        .await
+        .unwrap()
+        .into_split();
+    let trickle = tokio::spawn(async move {
+        let _ = wr
+            .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nx-pad: ")
+            .await;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if wr.write_all(b"a").await.is_err() {
+                break;
+            }
+        }
+    });
+    let t0 = Instant::now();
+    let (got, closed) = read_until_closed(&mut rd, Duration::from_secs(5)).await;
+    assert!(closed, "a trickled request head kept the connection open");
+    assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    trickle.abort();
+    // a keep-alive connection that goes idle after a response is closed as well
+    let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    s.write_all(
+        format!(
+            "GET /v1/models HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {}\r\n\r\n",
+            e.token
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let t0 = Instant::now();
+    let (got, closed) = read_until_closed(&mut s, Duration::from_secs(5)).await;
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+    assert!(closed, "an idle keep-alive connection stayed open");
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    // the timeout covers request heads only: a stream outliving it is not cut
+    let text = post_chat(&e, &chat("hold", true))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("hold#4"), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert_eq!(post_chat(&e, &chat("hi", false)).await.status(), 200);
+}
+
+#[tokio::test]
+async fn connections_over_the_cap_are_closed_at_once() {
+    let e = setup(|c| c.max_connections = 2).await;
+    let a = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let b = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let mut over = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let t0 = Instant::now();
+    let (got, closed) = read_until_closed(&mut over, Duration::from_secs(5)).await;
+    assert!(closed, "a connection over the cap was kept open");
+    assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    assert!(!models_ok(&e).await, "served a request over the cap");
+    // a place comes back as soon as one of the open connections closes
+    drop(a);
+    let t0 = Instant::now();
+    let mut served = false;
+    while !served && t0.elapsed() < Duration::from_secs(5) {
+        served = models_ok(&e).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(served, "the freed place was never reused");
+    drop(b);
+}
+
+#[tokio::test]
+async fn a_stalled_reader_loses_its_connection_and_place() {
+    let e = setup(|c| {
+        c.max_connections = 1;
+        c.stream_idle_timeout_secs = 1;
+        c.write_stall_timeout_secs = 2;
+    })
+    .await;
+    // holds the only place, never reads and never closes
+    let mut s = stalled_flood_client(&e).await;
+    assert!(eventually(|| e.gw.snapshot().active == 1, 2).await);
+    assert!(!models_ok(&e).await, "served a request over the cap");
+    let t0 = Instant::now();
+    let mut served = false;
+    while !served && t0.elapsed() < Duration::from_secs(10) {
+        served = models_ok(&e).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "a client that stopped reading kept its connection");
+    let (got, closed) = tokio::time::timeout(
+        Duration::from_secs(20),
+        read_until_closed(&mut s, Duration::from_secs(5)),
+    )
+    .await
+    .expect("the stream is still flowing to the stalled client");
+    assert!(got.starts_with(b"HTTP/1.1 200"));
+    assert!(closed);
+    assert!(
+        !got.ends_with(b"\r\n0\r\n\r\n"),
+        "the cut stream was terminated as complete"
+    );
+}
+
+#[tokio::test]
+async fn a_client_given_up_on_sees_a_failed_transfer_not_a_clean_end() {
+    let e = setup(|c| c.stream_idle_timeout_secs = 1).await;
+    let mut s = stalled_flood_client(&e).await;
+    assert!(
+        eventually(|| last_log(&e, true).is_some(), 8).await,
+        "the gateway never gave up on the stalled client"
+    );
+    assert_eq!(last_log(&e, true).unwrap(), (200, "client_stalled".into()));
+    // the client resumes reading: it must not get a cleanly terminated chunked body
+    let (got, closed) = read_until_closed(&mut s, Duration::from_secs(5)).await;
+    assert!(got.starts_with(b"HTTP/1.1 200"));
+    assert!(
+        !got.ends_with(b"\r\n0\r\n\r\n"),
+        "the abandoned stream ended as if complete"
+    );
+    assert!(closed, "the connection outlived the abandoned stream");
+}
+
+#[tokio::test]
+async fn shutdown_lets_streams_finish_and_closes_idle_connections() {
+    let e = setup(|_| {}).await;
+    let r = post_chat(&e, &chat("slow", true)).await;
+    let reader = tokio::spawn(r.text());
+    let mut idle = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let addr = e.gw.addr;
+    let Env { gw, .. } = e;
+    let t0 = Instant::now();
+    gw.shutdown().await;
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    let text = reader.await.unwrap().unwrap();
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let (_, closed) = read_until_closed(&mut idle, Duration::from_secs(3)).await;
+    assert!(closed, "an idle connection survived shutdown");
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "still accepting after shutdown"
+    );
+}
+
+#[test]
+fn connection_limits_have_serde_defaults() {
+    let c: GatewayConfig = serde_json::from_value(json!({"model_id": "m"})).unwrap();
+    assert_eq!(c.header_read_timeout_secs, 30);
+    assert_eq!(c.max_connections, 256);
+    assert_eq!(c.write_stall_timeout_secs, 180);
+    assert!(c.write_stall_timeout_secs > c.stream_idle_timeout_secs);
+}
+
 #[tokio::test]
 async fn host_allowlist_and_unready_engine_and_bind_guard() {
     let e = setup(|c| c.allowed_hosts = vec!["api.example.com".into()]).await;

@@ -454,6 +454,8 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "reqwest",
  "rusqlite",

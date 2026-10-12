@@ -11,14 +11,20 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures_util::StreamExt;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
@@ -33,8 +39,16 @@ pub struct GatewayConfig {
     pub model_id: String,
     pub db_path: PathBuf,
     pub max_body_bytes: usize,
+    /// Max time to receive a whole request head, counted from when the connection opens or
+    /// goes idle after a response. Closes silent, trickling and idle keep-alive connections.
+    pub header_read_timeout_secs: u64,
     /// Max time to receive the request body once headers are in (trickling clients).
     pub body_read_timeout_secs: u64,
+    /// Client connections open at once; connections beyond this are closed on accept.
+    pub max_connections: usize,
+    /// A response write blocked this long (the client stopped reading) closes the connection.
+    /// Keep it above `stream_idle_timeout_secs` so streams give up on such a client first.
+    pub write_stall_timeout_secs: u64,
     pub max_messages: usize,
     /// Simultaneous generations. Colibri serves one at a time; keep 1 unless verified.
     pub max_active: usize,
@@ -65,7 +79,10 @@ impl Default for GatewayConfig {
             model_id: "local-model".into(),
             db_path: PathBuf::from("hub.db"),
             max_body_bytes: 1 << 20,
+            header_read_timeout_secs: 30,
             body_read_timeout_secs: 30,
+            max_connections: 256,
+            write_stall_timeout_secs: 180,
             max_messages: 256,
             max_active: 1,
             max_queue: 4,
@@ -197,14 +214,7 @@ impl Gateway {
         let addr = listener.local_addr()?;
         let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
         let app = Router::new().fallback(handle).with_state(inner.clone());
-        let mut srx = stop_rx.clone();
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = srx.wait_for(|v| *v).await;
-                })
-                .await;
-        });
+        let server = tokio::spawn(serve(listener, app, inner.cfg.clone(), stop_rx.clone()));
         let probe_inner = inner.clone();
         let probe = tokio::spawn(async move { health_probe(probe_inner, &mut stop_rx).await });
         Ok(Gateway {
@@ -265,6 +275,147 @@ impl Inner {
         } else {
             Err(((1.0 - b.tokens) * 60.0 / rate).ceil().max(1.0) as u64)
         }
+    }
+}
+
+/// Accept loop for the public listener. `axum::serve` gives hyper no timer, which silently
+/// switches hyper's header-read timeout off, and it has no connection limit; this has both.
+/// On stop it closes the listener and lets open connections finish, as `axum::serve` did.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    cfg: GatewayConfig,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    // Clamped: hyper adds the timeout to `Instant::now()`, and an out-of-range permit count
+    // panics, either of which would kill this task and leave the gateway deaf.
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(
+            cfg.header_read_timeout_secs.clamp(1, 86_400),
+        ));
+    let write_stall = Duration::from_secs(cfg.write_stall_timeout_secs.max(1));
+    let places = Arc::new(Semaphore::new(
+        cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS),
+    ));
+    let graceful = GracefulShutdown::new();
+    loop {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            _ = stop.wait_for(|v| *v) => break,
+        };
+        let tcp = match accepted {
+            Ok((tcp, _)) => tcp,
+            Err(e) => {
+                // A connection that failed before it was accepted is skipped; anything else
+                // (out of sockets or handles) is waited out instead of spinning.
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                ) {
+                    tracing::warn!("gateway accept failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+        // Over the cap: close the new connection at once rather than let connections pile up.
+        let Ok(place) = places.clone().try_acquire_owned() else {
+            tracing::debug!("gateway connection limit reached; closing a new connection");
+            continue;
+        };
+        let io = TokioIo::new(WriteStall::new(tcp, write_stall));
+        let conn = graceful.watch(http.serve_connection(io, TowerToHyperService::new(app.clone())));
+        tokio::spawn(async move {
+            let _ = conn.await;
+            drop(place);
+        });
+    }
+    drop(listener);
+    graceful.shutdown().await;
+}
+
+/// A client socket whose writes fail once they have been blocked for `limit` because the
+/// client stopped reading, so a stalled reader cannot keep its connection (and its place
+/// under `max_connections`) forever. Any write progress restarts the clock.
+struct WriteStall {
+    io: tokio::net::TcpStream,
+    limit: Duration,
+    blocked: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl WriteStall {
+    fn new(io: tokio::net::TcpStream, limit: Duration) -> Self {
+        Self {
+            io,
+            limit,
+            blocked: None,
+        }
+    }
+
+    fn check(
+        &mut self,
+        cx: &mut Context<'_>,
+        r: Poll<std::io::Result<usize>>,
+    ) -> Poll<std::io::Result<usize>> {
+        if r.is_ready() {
+            self.blocked = None;
+            return r;
+        }
+        let limit = self.limit;
+        let t = self
+            .blocked
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match t.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::ErrorKind::TimedOut.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for WriteStall {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for WriteStall {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.io).poll_write(cx, buf);
+        me.check(cx, r)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.io).poll_write_vectored(cx, bufs);
+        me.check(cx, r)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
 }
 
@@ -892,6 +1043,14 @@ async fn send_frame(tx: &FrameTx, frame: Bytes, limit: Duration) -> Result<(), &
     }
 }
 
+/// Queue the stream's last frame and, if that worked, mark the stream finished. A stream that
+/// ends unfinished ends its body with an error (see `stream_response`).
+async fn send_last(tx: &FrameTx, frame: Bytes, limit: Duration, finished: &AtomicBool) {
+    if send_frame(tx, frame, limit).await.is_ok() {
+        finished.store(true, SeqCst);
+    }
+}
+
 /// Upstream error bodies are only parsed for their message: read at most 64 KiB of one.
 async fn capped_body(resp: reqwest::Response) -> Vec<u8> {
     let mut s = resp.bytes_stream();
@@ -921,6 +1080,10 @@ fn stream_response(
     mut log: ReqLog,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    // Set once the stream's last frame is queued: `[DONE]` passed through or a final error
+    // event. Set before `tx` drops, so the body sees it when the channel ends.
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = finished.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let _active = ActiveGuard::new(&inner);
@@ -971,7 +1134,7 @@ fn stream_response(
                 _ = tx.closed() => return, // client left: dropping `send` cancels upstream
                 _ = &mut first_deadline => {
                     log.status = 504; log.outcome = "deadline";
-                    let _ = send_frame(&tx, sse_error(&waited_too_long()), idle).await;
+                    send_last(&tx, sse_error(&waited_too_long()), idle, &done).await;
                     return;
                 }
             }
@@ -987,7 +1150,7 @@ fn stream_response(
                     "engine_error",
                     "The model engine is unreachable.",
                 );
-                let _ = send_frame(&tx, sse_error(&e), idle).await;
+                send_last(&tx, sse_error(&e), idle, &done).await;
                 return;
             }
         };
@@ -999,7 +1162,7 @@ fn stream_response(
             let e = upstream_error(st, &b);
             log.status = e.status.as_u16();
             log.outcome = "upstream_error";
-            let _ = send_frame(&tx, sse_error(&e), idle).await;
+            send_last(&tx, sse_error(&e), idle, &done).await;
             return;
         }
         log.status = 200;
@@ -1026,7 +1189,7 @@ fn stream_response(
                 }
                 _ = &mut first_deadline, if first => {
                     log.outcome = "deadline";
-                    let _ = send_frame(&tx, sse_error(&waited_too_long()), idle).await;
+                    send_last(&tx, sse_error(&waited_too_long()), idle, &done).await;
                     return;
                 }
                 _ = &mut stall, if !first => {
@@ -1037,7 +1200,7 @@ fn stream_response(
                         "stream_stalled",
                         "The model stopped producing output.",
                     );
-                    let _ = send_frame(&tx, sse_error(&e), idle).await;
+                    send_last(&tx, sse_error(&e), idle, &done).await;
                     return;
                 }
                 _ = &mut total => {
@@ -1048,7 +1211,7 @@ fn stream_response(
                         "deadline_exceeded",
                         "The stream exceeded its deadline.",
                     );
-                    let _ = send_frame(&tx, sse_error(&e), idle).await;
+                    send_last(&tx, sse_error(&e), idle, &done).await;
                     return;
                 }
             };
@@ -1062,7 +1225,7 @@ fn stream_response(
                         "engine_error",
                         "The model stream failed.",
                     );
-                    let _ = send_frame(&tx, sse_error(&e), idle).await;
+                    send_last(&tx, sse_error(&e), idle, &done).await;
                     return;
                 }
                 Some(Ok(chunk)) => {
@@ -1096,6 +1259,7 @@ fn stream_response(
         }
         if ends_with_done(&tail) {
             log.outcome = "ok";
+            done.store(true, SeqCst);
         } else {
             // The upstream closed without [DONE]: the engine died mid-answer (its SSE body is
             // close-delimited, so that reads as a clean end). Report it rather than pass a cut
@@ -1109,12 +1273,24 @@ fn stream_response(
                 "engine_error",
                 "The model stream ended unexpectedly.",
             );
-            let _ = send_frame(&tx, [sep, &sse_error(&e)].concat().into(), idle).await;
+            send_last(&tx, [sep, &sse_error(&e)].concat().into(), idle, &done).await;
         }
     });
-    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|c| (c, rx))
-    }));
+    // A task that ended without queueing a last frame gave up on a client that stopped
+    // reading (or failed). Ending the body with an error then makes hyper drop the connection
+    // without the final chunk, so the client sees a failed transfer rather than a cut answer
+    // that looks complete.
+    let body = Body::from_stream(futures_util::stream::unfold(
+        Some((rx, finished)),
+        |state| async move {
+            let (mut rx, finished) = state?;
+            match rx.recv().await {
+                Some(frame) => Some((frame, Some((rx, finished)))),
+                None if finished.load(SeqCst) => None,
+                None => Some((Err(std::io::Error::other("stream abandoned")), None)),
+            }
+        },
+    ));
     Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
