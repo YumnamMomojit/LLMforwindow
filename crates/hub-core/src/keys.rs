@@ -19,6 +19,7 @@ pub struct KeyRecord {
     pub scopes: Vec<String>,
     pub created_at: i64,
     pub expires_at: Option<i64>,
+    /// May lie in the future: a rotated key keeps working until then (its grace period).
     pub revoked_at: Option<i64>,
     pub last_used_at: Option<i64>,
 }
@@ -86,25 +87,47 @@ pub fn list(c: &Connection) -> anyhow::Result<Vec<KeyRecord>> {
     Ok(v)
 }
 
+/// Revoke now; this also ends the grace period of a rotated key.
 pub fn revoke(c: &Connection, id: &str) -> anyhow::Result<bool> {
     Ok(c.execute(
-        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1 AND revoked_at IS NULL",
+        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1 AND (revoked_at IS NULL OR revoked_at > ?2)",
         params![id, now()],
     )? > 0)
 }
 
-/// Issue a replacement with the same name; the old key keeps working for `grace_secs`.
+/// Issue a replacement with the same name; the old key keeps working for `grace_secs`
+/// (or until its own expiry, if that comes first).
+///
+/// The replacement keeps the old key's expiry, i.e. the remaining validity measured from now
+/// (none if the old key had none): rotation replaces the secret, it does not renew the key.
+/// The end of the grace period is recorded as a future `revoked_at`, so the old key's expiry
+/// is never shortened and cannot leak into a later replacement. Expired, revoked and
+/// already-rotated keys are refused: create a new key, or rotate the replacement.
 pub fn rotate(c: &Connection, id: &str, grace_secs: i64) -> anyhow::Result<(KeyRecord, String)> {
+    if grace_secs < 0 {
+        anyhow::bail!("grace period must not be negative");
+    }
     let old = get(c, id)?.ok_or_else(|| anyhow::anyhow!("no such key"))?;
-    if old.revoked_at.is_some() {
+    let t = now();
+    if old.revoked_at.is_some_and(|r| r <= t) {
         anyhow::bail!("key is already revoked");
     }
+    if let Some(e) = old.expires_at.filter(|&e| e <= t) {
+        anyhow::bail!(
+            "key expired at {e} (unix time); an expired key cannot be rotated, create a new key"
+        );
+    }
+    if let Some(r) = old.revoked_at {
+        anyhow::bail!(
+            "key was already rotated and stops working at {} (unix time); \
+             rotate its replacement (same name) instead",
+            old.expires_at.map_or(r, |e| e.min(r))
+        );
+    }
     let (rec, tok) = create(c, &old.name, old.expires_at)?;
-    let until = now() + grace_secs.max(0);
-    let new_exp = old.expires_at.map_or(until, |e| e.min(until));
     c.execute(
-        "UPDATE api_keys SET expires_at=?2 WHERE id=?1",
-        params![id, new_exp],
+        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1",
+        params![id, t.saturating_add(grace_secs)],
     )?;
     Ok((rec, tok))
 }
@@ -141,7 +164,7 @@ pub fn verify(
         return Err(AuthError::Invalid);
     }
     let rec = get(c, id).ok().flatten().ok_or(AuthError::Invalid)?;
-    if rec.revoked_at.is_some() {
+    if rec.revoked_at.is_some_and(|r| r <= now()) {
         return Err(AuthError::Revoked);
     }
     if rec.expires_at.is_some_and(|e| e <= now()) {
