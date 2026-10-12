@@ -411,7 +411,17 @@ async fn main() -> Result<()> {
                     let grace = hrs.checked_mul(3600).context("grace out of range")?;
                     let c = db::open(&db_path)?;
                     let (rec, tok) = keys::rotate(&c, &id, grace)?;
-                    println!("new id: {}\nsecret (shown once):\n{tok}\nold key {id} stays valid for {hrs} h", rec.id);
+                    let old = keys::get(&c, &id)?.context("no such key")?;
+                    // The old key ends at its grace end or its own expiry, whichever is first.
+                    let old_end = old
+                        .revoked_at
+                        .map(|r| old.expires_at.map_or(r, |e| e.min(r)));
+                    println!(
+                        "new id: {}\nsecret (shown once):\n{tok}\nnew key expires: {}\nold key {id} stays valid until {} (unix time; grace requested: {hrs} h)",
+                        rec.id,
+                        fmt_time(rec.expires_at),
+                        fmt_time(old_end)
+                    );
                 }
                 _ => return Err(usage_error(format!("unknown key subcommand '{sub}'"))),
             }
@@ -589,7 +599,11 @@ async fn serve(dir: &Path, db_path: &Path, o: ServeOpts) -> Result<()> {
     })?;
     // Records added before verbatim paths were stripped still work.
     let model_dir = engine_path(rec.path)?;
-    if keys::list(&c)?.iter().all(|k| k.revoked_at.is_some()) {
+    let t = hub_core_now();
+    if keys::list(&c)?
+        .iter()
+        .all(|k| k.revoked_at.is_some_and(|r| r <= t) || k.expires_at.is_some_and(|e| e <= t))
+    {
         say_err!("note: no active API keys; create one with `hubd key create <name>`");
     }
     let store = FileSecrets::new(&dir.join("secrets"))?;

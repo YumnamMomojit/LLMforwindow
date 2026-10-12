@@ -9,6 +9,7 @@
 | upstream | http://127.0.0.1:18080 | must be http + loopback (set automatically by `serve`) |
 | model_id | — | only id served/accepted |
 | max_body_bytes / max_messages | 1 MiB / 256 | |
+| body_read_timeout_secs | 30 | a request body not fully received in time gets 408 `request_timeout` (no header-read timeout yet: axum::serve exposes none) |
 | max_active / max_queue | 1 / 4 | simultaneous generations / waiters |
 | queue_timeout_secs / request_deadline_secs | 30 / 900 | |
 | first_byte_timeout_secs / stream_idle_timeout_secs / keepalive_secs | 600 / 120 / 15 | |

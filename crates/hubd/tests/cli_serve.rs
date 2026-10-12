@@ -27,10 +27,14 @@ def resolve_model(model_dir):
 
 const LAUNCHER: &str = r#"
 # Fake c/openai_server.py. FAKE_ENGINE_MODE: crash | hang (endless model load) | serve.
-import json, os, subprocess, sys, time
+import argparse, json, os, subprocess, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+# argparse, like upstream: accepts both "--opt value" and "--opt=value".
+ap = argparse.ArgumentParser()
+for opt in ("--model", "--host", "--port", "--model-id", "--max-tokens", "--engine"):
+    ap.add_argument(opt)
+args = {f"--{k.replace('_', '-')}": v for k, v in vars(ap.parse_args()).items()}
 mode = os.environ["FAKE_ENGINE_MODE"]
 if mode == "crash":
     print("MemoryError: cannot allocate the expert cache", file=sys.stderr)
@@ -55,7 +59,10 @@ class Models(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-HTTPServer(("127.0.0.1", int(args["--port"])), Models).serve_forever()
+srv = HTTPServer(("127.0.0.1", int(args["--port"])), Models)
+# Same line, same stream, same moment (after bind) as upstream openai_server.py serve().
+print(f"OpenAI-compatible API listening on http://127.0.0.1:{args['--port']}/v1", file=sys.stderr, flush=True)
+srv.serve_forever()
 "#;
 
 struct Fixture {

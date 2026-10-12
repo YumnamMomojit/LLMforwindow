@@ -47,7 +47,7 @@ impl OwnedChild {
         {
             let job = win::Job::new()?;
             job.assign(&child)?;
-            return Ok(Self { child, job });
+            Ok(Self { child, job })
         }
         #[cfg(not(windows))]
         Ok(Self { child })

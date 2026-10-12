@@ -295,8 +295,11 @@ async fn auth_matrix() {
         "revoked_api_key"
     );
     // expired
-    let (rec, tok) = keys::create(&e.db, "old", Some(1)).unwrap();
-    let _ = rec;
+    // create() refuses a past expiry, so make a valid key and age it in the database.
+    assert!(keys::create(&e.db, "past", Some(1)).is_err());
+    let (rec, tok) = keys::create(&e.db, "old", Some(i64::MAX / 2)).unwrap();
+    e.db.execute("UPDATE api_keys SET expires_at=1 WHERE id=?1", [&rec.id])
+        .unwrap();
     assert_eq!(
         c.post(&url)
             .bearer_auth(tok)
