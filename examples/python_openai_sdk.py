@@ -19,9 +19,13 @@ r = client.chat.completions.create(model=model, max_tokens=64,
                                    messages=[{"role": "user", "content": "Say hello."}])
 print(r.choices[0].message.content, r.usage)
 
+usage = None
 for chunk in client.chat.completions.create(model=model, max_tokens=64, stream=True,
                                             stream_options={"include_usage": True},
                                             messages=[{"role": "user", "content": "Count to five."}]):
+    if chunk.usage:     # final chunk when include_usage is set
+        usage = chunk.usage
     if chunk.choices and chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
 print()
+print("stream usage:", usage)

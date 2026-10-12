@@ -18,6 +18,10 @@ for await (const chunk of res.body) {
     if (ev === "data: [DONE]") process.exit(0);
     const j = JSON.parse(ev.slice(6));
     if (j.error) { console.error(j.error); process.exit(1); }
-    process.stdout.write(j.choices?.[0]?.delta?.content ?? "");
+    const d = j.choices?.[0]?.delta ?? {};
+    if (d.reasoning_content) process.stderr.write(d.reasoning_content); // thinking models (upstream extension)
+    process.stdout.write(d.content ?? "");
   }
 }
+console.error("stream ended without [DONE]"); // a stream cut short is not a complete answer
+process.exit(1);

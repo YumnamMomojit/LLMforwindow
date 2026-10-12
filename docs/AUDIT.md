@@ -26,7 +26,7 @@ Status legend: **Impl** = merged and used as-is; **Reuse** = usable with a wrapp
 | Area | Status | Notes |
 |---|---|---|
 | OpenAI-style `GET /v1/models`, `POST /v1/chat/completions`, SSE, usage | **Impl** (upstream) | verified live against fixture (see VERIFICATION) |
-| Engine families | **Impl** | `family_registry`: glm53, glm, inkling, kimi, olmoe, qwen36 (+Qwen3-Coder, Qwen3.8-27B), qwen38, deepseek_v4, deepseek_v41, mimo, qwen_image (image), laya, gliner_decide (decision). Hub chat supports **text chat families only**; image/decision engines are rejected at the gateway by design. |
+| Engine families | **Impl** | `family_registry`: glm53, glm, inkling, kimi, olmoe, qwen36 (+Qwen3-Coder, Qwen3.8-27B), qwen38, deepseek_v4, deepseek_v41, mimo, qwen_image (image), laya, gliner_decide (decision). Hub chat supports **text chat families only**; image/decision families are rejected at model validation (`hubd model validate`/`add`) by design. |
 | Model format | **Impl** | HF-style dir: `config.json`, `tokenizer.json`, safetensors shards; some families need an upstream conversion/prep step ("By hand" table). **No GGUF serving** — not assumed. |
 | CPU backend | **Impl** | pure C; no GPU needed |
 | Vulkan backend | **Impl, Unverified here** | in Windows release; runtime-loaded; falls back to CPU without Vulkan |

@@ -16,4 +16,7 @@
 | rate_limit_per_min | 30 | per key; 0 = off |
 | allowed_hosts | [] | Host allowlist; empty = any |
 
-`hubd serve` flags: `--port`, `--max-active`, `--share` group. Data dir: `--data-dir` / `HUB_DATA_DIR`. Settings in DB: `history.enabled`, `history.retention_days`.
+`hubd serve` flags: `--port` (8787), `--max-active` (1..16, default 1), `--startup-timeout` (seconds to wait for the engine to become ready,
+1..86400, default 900), `--share` group. Data dir: `--data-dir` / `HUB_DATA_DIR`. Engine runtime: `--python` / `HUB_PYTHON` (else `python3`,
+`python.exe` on Windows, from PATH) and `--colibri-dir` / `HUB_COLIBRI_DIR`; a flag wins over the variable. Unknown flags, extra arguments
+and flags without a value are errors. Settings in DB: `history.enabled`, `history.retention_days`.

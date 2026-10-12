@@ -13,13 +13,15 @@ no model weights, no Cloudflare account/domain. Date 2026-10-12. Upstream pinned
 | Client disconnect frees slot & drops upstream stream | **Tested** (mock). **Real engine: not proven** — fixture finished before the 1 s cut | gateway test `client_disconnect_cancels_upstream_and_frees_slot` |
 | Bounded queue, no output crossover, per-key rate limit | **Tested** (mock); queue/429/serialisation also observed with 6 parallel curl clients on the real engine (1×429, 5×200) | gateway tests; manual run |
 | Verified usage logged, prompts not logged | **Tested** | `usage_and_metadata_logging_without_prompts` |
-| Real clients: curl, Python stdlib, OpenAI SDK 3.29.0, Node, verify_remote | **Tested** against real engine+fixture | `COLIBRI_DIR=... scripts/e2e_real_fixture.sh` → all steps ran, `PASS: no orphans` |
-| Engine start/readiness/stop, actionable errors, process-tree cleanup | **Tested on Linux** (no orphans after SIGINT). Windows Job Object: **compiles, not run** | e2e script; `cargo check --target x86_64-pc-windows-gnu` OK |
+| Real clients: curl, Python stdlib, OpenAI SDK 3.29.0, Node, verify_remote | **Tested** against real engine+fixture (output is noise) | `COLIBRI_DIR=... scripts/e2e_real_fixture.sh`. Asserted: every client exits 0; curl lists the model and streams a non-empty delta and `data: [DONE]`; the stdlib and Node examples exit nonzero without `[DONE]` and must print text (the fixture only emits `reasoning_content`, which they show on stderr); the SDK reports `completion_tokens` ≥ 1 for JSON and in the stream's usage chunk; verify_remote passes |
+| Engine start/readiness/stop, process-tree cleanup | **Tested on Linux**. Real engine: hubd exits 0 and no engine process survives SIGINT, nor SIGTERM in a second run (e2e script). Fake launcher with a child standing in for the engine: SIGINT/SIGTERM/SIGHUP during the model load and while serving, `--startup-timeout` expiry, port/token/cloudflared errors reported before the engine starts. Windows Job Object and console events: **compile only, not run** | e2e script; `cargo test -p hubd --test cli_serve`; `cargo check --target x86_64-pc-windows-gnu` |
+| Actionable engine start errors | **One case tested** (out-of-memory text from a fake launcher → actionable message, exit code 1); the other messages are never triggered by a test or a real engine failure | `cli_serve` |
+| CLI arguments: help anywhere, missing/unknown/extra arguments, flags without values, `--expires-days`/`--grace-hours` ranges, empty tunnel token | **Tested** | `cargo test -p hubd --test cli_args` |
 | Model validation, bad-folder rejection | **Tested** (fixture dir vs empty dir) | `hubd model validate` |
 | Storage: traversal, reserved names, quota-in-write, reserve, overwrite accounting, symlink escape, export/backup, interrupted-write cleanup, migrations | **Tested** Linux | `cargo test -p hub-core --test storage` → 8 passed. Junction test written for Windows CI, **not run** |
 | History: no-history, retention, inert text | **Tested** | storage tests |
 | DPAPI secrets | **Compiles for Windows; not run**; Linux uses 0600 file (dev) | |
-| Cloudflare tunnel | **Implemented, never run** (no account, no cloudflared). cloudflared CLI flags unverified | |
+| Cloudflare tunnel | **Implemented, never run** (no account, no cloudflared). cloudflared CLI flags unverified. Only hubd's side is tested, with a fake cloudflared that logs "Registered tunnel connection": `sharing: CONNECTING` → `CONNECTED`, token never printed, connector stopped with hubd | `cli_serve` `sharing_state_is_reported_and_stops_with_hubd` |
 | Public HTTPS reachability, separate-network test | **Blocked / unverified** | needs domain+tunnel; `scripts/verify_remote.py` ready |
 | Windows paths with spaces/Unicode, fresh Windows install, upgrade, uninstall, installer | **Not done** | no Windows host; no installer exists |
 | Desktop UI (Dashboard/Models/Chat/Sharing/Storage/Settings), tray, autostart, Tauri capabilities/CSP | **Not built** (deferred) | upstream stub only |
@@ -27,6 +29,24 @@ no model weights, no Cloudflare account/domain. Date 2026-10-12. Upstream pinned
 | GPU fallback tests, VRAM preflight | **Deferred / untested** | |
 | Stop-Sharing-while-chat-continues | Design supports it (`CloudflaredTunnel::stop`); **not exercised** | |
 | Containers | **Roadmap doc only** (`docs/CONTAINERS.md`) | |
+
+## Review round 2026-10-12
+An independent review made 39 claims; two verifiers checked each: **22 confirmed, 9 disputed** (one verifier said real), **8 refuted**.
+Fixed in the CLI, scripts and docs group (fixes in the core modules are listed separately):
+* `hubd serve` handled only Ctrl-C, and only once serving: Ctrl-C during the model load, SIGTERM or SIGHUP left the engine running on
+  Linux/macOS, and errors after the engine start (port taken, missing token) returned without stopping it. Now stop requests are handled
+  from before the engine starts (Unix: SIGINT/SIGTERM/SIGHUP; Windows: Ctrl-C/Ctrl-Break/console close), every exit path stops the engine,
+  port, token and cloudflared path are checked before the model load, an engine failure exits nonzero, and `--startup-timeout` exists.
+* Model paths were stored as Windows verbatim paths (`\\?\D:\...`), which the C engine cannot open; now stored in plain form (string logic
+  unit-tested on Linux; the Windows `canonicalize` test is written, **not run**).
+* Docs said image/decision engines are rejected at the gateway, which nothing did; they now say "at model validation", where the core
+  fix adds the check.
+* `serve --share` printed `LOCAL ONLY` and never the tunnel state, and an empty tunnel token was accepted; the state is now printed and an
+  empty token is refused.
+* `key create --expires-days` without a value made a never-expiring key; 0, negative and huge values made dead keys or panicked. Now 1..3650.
+* Missing arguments panicked; unknown or extra arguments were ignored (`purge --help` purged). Parsing is now strict; help never acts.
+* The e2e script asserted nothing for four clients and leaked its temp dir on early failure; the rows above now state what it asserts.
+* The portable build script could ship a stale `hubd.exe`, nested folders on re-run, and the bundled Python was unused (still **untested**).
 
 ## Smallest remaining validation
 1. Windows 11 box: `cargo test --workspace` (runs the junction test) and `scripts\e2e` equivalent with the Windows release engines + a fixture.
