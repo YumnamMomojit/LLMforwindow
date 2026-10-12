@@ -102,6 +102,123 @@ fn revoke_ends_a_rotation_grace_period() {
     assert!(auth(&c, &b_tok).is_ok());
 }
 
+/// Moves a key's `revoked_at` into the future: the stand-in for the system clock being
+/// stepped back after the revocation (e.g. a fast clock corrected by time sync).
+fn clock_steps_back(c: &Connection, id: &str) {
+    c.execute(
+        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1",
+        rusqlite::params![id, now() + 3600],
+    )
+    .unwrap();
+}
+
+#[test]
+fn explicit_revocation_survives_the_clock_moving_back() {
+    let (_d, c) = key_db();
+    let (a, a_tok) = keys::create(&c, "leaked", None).unwrap();
+    assert!(keys::revoke(&c, &a.id).unwrap());
+    clock_steps_back(&c, &a.id);
+    assert_eq!(auth(&c, &a_tok).unwrap_err(), keys::AuthError::Revoked);
+    let rec = keys::get(&c, &a.id).unwrap().unwrap();
+    assert!(rec.revoked && rec.is_revoked_at(now()));
+    let e = keys::rotate(&c, &a.id, 3600).unwrap_err();
+    assert!(e.to_string().contains("already revoked"), "{e}");
+    assert!(!keys::revoke(&c, &a.id).unwrap(), "already revoked");
+    assert_eq!(keys::list(&c).unwrap().len(), 1);
+
+    // Revoking a rotated key during its grace period is just as permanent.
+    let (b, b_tok) = keys::create(&c, "ci", None).unwrap();
+    let (_, b2_tok) = keys::rotate(&c, &b.id, 3600).unwrap();
+    assert!(keys::revoke(&c, &b.id).unwrap());
+    clock_steps_back(&c, &b.id);
+    assert_eq!(auth(&c, &b_tok).unwrap_err(), keys::AuthError::Revoked);
+    assert!(auth(&c, &b2_tok).is_ok());
+}
+
+#[test]
+fn rotation_grace_is_not_a_revocation() {
+    let (_d, c) = key_db();
+    let (a, a_tok) = keys::create(&c, "ci", None).unwrap();
+    let (_, b_tok) = keys::rotate(&c, &a.id, 3600).unwrap();
+    let a2 = keys::get(&c, &a.id).unwrap().unwrap();
+    assert!(!a2.revoked && !a2.is_revoked_at(now()));
+    assert!(a2.revoked_at.is_some_and(|r| r > now()));
+    assert!(auth(&c, &a_tok).is_ok(), "grace period");
+    // The grace period ends by the clock.
+    c.execute(
+        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1",
+        rusqlite::params![a.id, now() - 1],
+    )
+    .unwrap();
+    assert_eq!(auth(&c, &a_tok).unwrap_err(), keys::AuthError::Revoked);
+    assert!(auth(&c, &b_tok).is_ok());
+}
+
+/// Turns a freshly created database back into the given older schema version.
+fn downgrade(c: &Connection, to: i64) {
+    if to < 3 {
+        c.execute_batch("ALTER TABLE api_keys DROP COLUMN revoked;")
+            .unwrap();
+    }
+    if to < 2 {
+        c.execute_batch(
+            "DROP TABLE messages; DROP TABLE conversations; DROP TABLE files;
+             DROP TABLE workspaces;",
+        )
+        .unwrap();
+    }
+    c.pragma_update(None, "user_version", to).unwrap();
+}
+
+#[test]
+fn migration_from_v2_keeps_revoked_keys_revoked_and_grace_periods_running() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("v2.db");
+    let (revoked, rotated, grace_over, active);
+    {
+        let c = db::open(&p).unwrap();
+        revoked = keys::create(&c, "revoked", None).unwrap();
+        rotated = keys::create(&c, "rotated", None).unwrap();
+        grace_over = keys::create(&c, "grace-over", None).unwrap();
+        active = keys::create(&c, "active", None).unwrap();
+        downgrade(&c, 2);
+        // v2 kept both an explicit revocation and a rotation grace end in `revoked_at`.
+        for (id, at) in [
+            (&revoked.0.id, now() - 60),
+            (&rotated.0.id, now() + 3600),
+            (&grace_over.0.id, now() - 1),
+        ] {
+            c.execute(
+                "UPDATE api_keys SET revoked_at=?2 WHERE id=?1",
+                rusqlite::params![id, at],
+            )
+            .unwrap();
+        }
+    }
+    let c = db::open(&p).unwrap();
+    assert_eq!(db::schema_version(&c), 3);
+    let get = |id: &str| keys::get(&c, id).unwrap().unwrap();
+    assert!(get(&revoked.0.id).revoked);
+    assert!(get(&grace_over.0.id).revoked);
+    assert!(!get(&rotated.0.id).revoked);
+    assert!(!get(&active.0.id).revoked);
+    // Revoked before the upgrade: still revoked, now independently of the clock.
+    clock_steps_back(&c, &revoked.0.id);
+    assert_eq!(auth(&c, &revoked.1).unwrap_err(), keys::AuthError::Revoked);
+    clock_steps_back(&c, &grace_over.0.id);
+    assert_eq!(
+        auth(&c, &grace_over.1).unwrap_err(),
+        keys::AuthError::Revoked
+    );
+    // A grace period running at the upgrade keeps running, and the key is still "rotated".
+    assert!(auth(&c, &rotated.1).is_ok());
+    let e = keys::rotate(&c, &rotated.0.id, 3600).unwrap_err();
+    assert!(e.to_string().contains("already rotated"), "{e}");
+    assert!(auth(&c, &active.1).is_ok());
+    assert!(keys::revoke(&c, &rotated.0.id).unwrap());
+    assert_eq!(auth(&c, &rotated.1).unwrap_err(), keys::AuthError::Revoked);
+}
+
 /// The only file in the secrets directory (its extension differs per platform).
 fn only_file(dir: &std::path::Path) -> std::path::PathBuf {
     let v: Vec<_> = std::fs::read_dir(dir)
@@ -152,13 +269,7 @@ fn concurrent_opens_migrate_once() {
         let p = Arc::new(d.path().join("race.db"));
         if round % 2 == 1 {
             // A v1 database, as left by an older build.
-            db::open(&p)
-                .unwrap()
-                .execute_batch(
-                    "DROP TABLE messages; DROP TABLE conversations; DROP TABLE files;
-                     DROP TABLE workspaces; PRAGMA user_version=1;",
-                )
-                .unwrap();
+            downgrade(&db::open(&p).unwrap(), 1);
         }
         let n = 4;
         let gate = Arc::new(Barrier::new(n));
@@ -173,7 +284,7 @@ fn concurrent_opens_migrate_once() {
             .collect();
         for h in hs {
             let v = h.join().unwrap();
-            assert_eq!(v.as_ref().ok(), Some(&2), "round {round}: {v:?}");
+            assert_eq!(v.as_ref().ok(), Some(&3), "round {round}: {v:?}");
         }
     }
 }

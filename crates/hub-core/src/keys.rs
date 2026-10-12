@@ -20,8 +20,18 @@ pub struct KeyRecord {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     /// May lie in the future: a rotated key keeps working until then (its grace period).
+    /// For an explicitly revoked key it is informational only; `revoked` decides.
     pub revoked_at: Option<i64>,
     pub last_used_at: Option<i64>,
+    /// Explicitly revoked (`revoke`): permanent, whatever the system clock says.
+    pub revoked: bool,
+}
+
+impl KeyRecord {
+    /// Revoked at unix time `t`: explicitly, or because its rotation grace period has ended.
+    pub fn is_revoked_at(&self, t: i64) -> bool {
+        self.revoked || self.revoked_at.is_some_and(|r| r <= t)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -71,9 +81,10 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<KeyRecord> {
         expires_at: r.get(4)?,
         revoked_at: r.get(5)?,
         last_used_at: r.get(6)?,
+        revoked: r.get(7)?,
     })
 }
-const COLS: &str = "id,name,scopes,created_at,expires_at,revoked_at,last_used_at";
+const COLS: &str = "id,name,scopes,created_at,expires_at,revoked_at,last_used_at,revoked";
 
 pub fn get(c: &Connection, id: &str) -> anyhow::Result<Option<KeyRecord>> {
     Ok(c.query_row(
@@ -90,10 +101,13 @@ pub fn list(c: &Connection) -> anyhow::Result<Vec<KeyRecord>> {
     Ok(v)
 }
 
-/// Revoke now; this also ends the grace period of a rotated key.
+/// Revoke now; this also ends the grace period of a rotated key. Revocation is a flag, not a
+/// time, so moving the system clock back later cannot revive the key. `false` if there is no
+/// such key or it was already revoked with this function.
 pub fn revoke(c: &Connection, id: &str) -> anyhow::Result<bool> {
     Ok(c.execute(
-        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1 AND (revoked_at IS NULL OR revoked_at > ?2)",
+        "UPDATE api_keys SET revoked=1, revoked_at=MIN(COALESCE(revoked_at, ?2), ?2)
+         WHERE id=?1 AND revoked=0",
         params![id, now()],
     )? > 0)
 }
@@ -103,16 +117,17 @@ pub fn revoke(c: &Connection, id: &str) -> anyhow::Result<bool> {
 ///
 /// The replacement keeps the old key's expiry, i.e. the remaining validity measured from now
 /// (none if the old key had none): rotation replaces the secret, it does not renew the key.
-/// The end of the grace period is recorded as a future `revoked_at`, so the old key's expiry
-/// is never shortened and cannot leak into a later replacement. Expired, revoked and
-/// already-rotated keys are refused: create a new key, or rotate the replacement.
+/// The end of the grace period is recorded as a future `revoked_at` (without the `revoked`
+/// flag), so the old key's expiry is never shortened and cannot leak into a later replacement.
+/// Expired, revoked and already-rotated keys are refused: create a new key, or rotate the
+/// replacement.
 pub fn rotate(c: &Connection, id: &str, grace_secs: i64) -> anyhow::Result<(KeyRecord, String)> {
     if grace_secs < 0 {
         anyhow::bail!("grace period must not be negative");
     }
     let old = get(c, id)?.ok_or_else(|| anyhow::anyhow!("no such key"))?;
     let t = now();
-    if old.revoked_at.is_some_and(|r| r <= t) {
+    if old.is_revoked_at(t) {
         anyhow::bail!("key is already revoked");
     }
     if let Some(e) = old.expires_at.filter(|&e| e <= t) {
@@ -129,7 +144,7 @@ pub fn rotate(c: &Connection, id: &str, grace_secs: i64) -> anyhow::Result<(KeyR
     }
     let (rec, tok) = create(c, &old.name, old.expires_at)?;
     c.execute(
-        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1",
+        "UPDATE api_keys SET revoked_at=?2 WHERE id=?1 AND revoked=0",
         params![id, t.saturating_add(grace_secs)],
     )?;
     Ok((rec, tok))
@@ -167,7 +182,7 @@ pub fn verify(
         return Err(AuthError::Invalid);
     }
     let rec = get(c, id).ok().flatten().ok_or(AuthError::Invalid)?;
-    if rec.revoked_at.is_some_and(|r| r <= now()) {
+    if rec.is_revoked_at(now()) {
         return Err(AuthError::Revoked);
     }
     if rec.expires_at.is_some_and(|e| e <= now()) {

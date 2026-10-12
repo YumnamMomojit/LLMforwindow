@@ -33,6 +33,13 @@ const MIGRATIONS: &[&str] = &[
      CREATE TABLE messages(
         id INTEGER PRIMARY KEY, conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);",
+    // v3: explicit revocation is a flag, so it holds whatever the system clock does later;
+    // `revoked_at` alone may lie in the future (the end of a rotation grace period). A v2
+    // `revoked_at` already past is a revocation or an ended grace period, dead either way, so
+    // it is flagged; one still in the future is a running grace period, as v2 treated it.
+    "ALTER TABLE api_keys ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0;
+     UPDATE api_keys SET revoked=1
+        WHERE revoked_at IS NOT NULL AND revoked_at <= CAST(strftime('%s','now') AS INTEGER);",
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
