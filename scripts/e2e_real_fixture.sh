@@ -14,9 +14,43 @@ PORT="${HUB_E2E_PORT:-18787}"
 PY="${PYTHON:-python3}"
 WORK="$(mktemp -d)"
 HUBD_PID=""
+# The engine tree of the running hubd (launcher, C engine, ...) and their process groups,
+# recorded while it serves: the C engine gets the model path through its environment, so
+# its command line (`<colibri>/mimo <cap>`) never names $WORK and pgrep -f cannot find it.
+ENGINE_PIDS=""; ENGINE_PGIDS=""
+MY_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 
 # Running, i.e. neither gone nor a zombie waiting to be reaped.
 alive() { local s; s=$(ps -p "$1" -o stat= 2>/dev/null) || return 1; case "$s" in Z*) return 1;; esac; }
+
+# descendants PID: every process below PID.
+descendants() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
+
+# engine_tree: remember the running hubd's engine tree and its process groups.
+engine_tree() {
+  local p
+  ENGINE_PIDS=$(descendants "$HUBD_PID")
+  ENGINE_PGIDS=$(for p in $ENGINE_PIDS; do ps -o pgid= -p "$p" || true; done | tr -d ' ' | { grep -vx "$MY_PGID" || true; } | sort -u)
+}
+
+# record_engine: engine_tree, which must exist and must not share this script's process group.
+record_engine() {
+  local p
+  engine_tree
+  [ -n "$ENGINE_PIDS" ] || fail "hubd has no engine processes while serving"
+  for p in $ENGINE_PIDS; do
+    [ "$(ps -o pgid= -p "$p" | tr -d ' ')" != "$MY_PGID" ] || fail "an engine process is in the test script's process group"
+  done
+}
+
+# survivors: live processes of the recorded engine tree, of its process groups, or naming $WORK.
+survivors() {
+  local p
+  { for p in $ENGINE_PIDS; do echo "$p"; done
+    for p in $ENGINE_PGIDS; do pgrep -g "$p" 2>/dev/null || true; done
+    pgrep -f "$WORK/" 2>/dev/null || true
+  } | sort -u | while read -r p; do if [ -n "$p" ] && alive "$p"; then echo "$p"; fi; done
+}
 
 # stop_hubd SIGNAL: signal hubd, wait up to 30 s, SIGKILL it if it hangs; returns hubd's exit status.
 stop_hubd() {
@@ -30,8 +64,10 @@ stop_hubd() {
 }
 
 cleanup() {
-  if [ -n "$HUBD_PID" ]; then stop_hubd INT || true; fi
-  pkill -KILL -f "$WORK/model" 2>/dev/null || true   # last resort only; orphans already failed the run
+  local p
+  if [ -n "$HUBD_PID" ]; then engine_tree; stop_hubd INT || true; fi
+  # Last resort only (orphans already failed the run): what is left of the engine tree.
+  for p in $(survivors); do kill -KILL "$p" 2>/dev/null || true; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -55,14 +91,19 @@ start_hubd() {
   fail "hubd not ready after 120 s"
 }
 
-# shutdown_check SIGNAL: hubd must exit 0 and leave no engine process behind.
+# shutdown_check SIGNAL: hubd must exit 0 and leave no engine process behind (launcher and
+# C engine alike).
 shutdown_check() {
-  local rc=0
+  local rc=0 left
   echo "== SIG$1 shutdown leaves no orphans"
+  record_engine
+  echo "engine tree: $(for p in $ENGINE_PIDS; do ps -o pid=,args= -p "$p"; done | tr -s ' ' | paste -sd ';' -)"
   stop_hubd "$1" || rc=$?
   [ "$rc" -eq 0 ] || fail "hubd exited with status $rc after SIG$1"
   sleep 1
-  if pgrep -f "$WORK/model" >/dev/null; then pgrep -fa "$WORK/model" || true; fail "orphan engine processes after SIG$1"; fi
+  left=$(survivors)
+  if [ -n "$left" ]; then ps -o pid=,pgid=,args= -p "$(echo $left | tr ' ' ,)" || true; fail "orphan engine processes after SIG$1"; fi
+  ENGINE_PIDS=""; ENGINE_PGIDS=""   # all gone: their numbers may be reused from now on
   echo "PASS: SIG$1, no orphans"
 }
 

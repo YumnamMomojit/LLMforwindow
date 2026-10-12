@@ -66,7 +66,9 @@ def main():
                     done = True
     spread = (arrivals[-1] - arrivals[0]) if len(arrivals) > 1 else 0
     check("SSE content-type + [DONE]", ctype.startswith("text/event-stream") and done, f"events={len(arrivals)}")
-    check("SSE incremental (events spread over time, not one buffered blob)", len(arrivals) > 3 and spread > 0.05, f"spread={spread:.2f}s")
+    # A body that arrives as one buffered blob is read out in well under a millisecond; a fast
+    # engine (the e2e fixture) can stream 60 events in 40 ms, so 10 ms separates the two.
+    check("SSE incremental (events spread over time, not one buffered blob)", len(arrivals) > 3 and spread > 0.01, f"spread={spread:.3f}s")
     finish(results, a)
 
 def finish(results, a):

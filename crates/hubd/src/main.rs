@@ -20,16 +20,17 @@ USAGE: hubd [--data-dir DIR] <command>
   model list | model remove <id>        (catalog entry only; files are never deleted)
   key create <name> [--expires-days N]  (N = 1..3650; secret shown ONCE)
   key list | key revoke <id> | key rotate <id> [--grace-hours N]   (N = 0..720, default 24)
-  secret set tunnel_token               (reads the value from stdin)
+  secret set tunnel_token               (reads one line from stdin; typing at a terminal is hidden)
   serve --model ID [--colibri-dir C] [--python P] [--port N] [--max-active N]
         [--startup-timeout SECS] [--share --cloudflared EXE --hostname H --i-authorize-public-sharing]
   purge                                  apply history/log retention
   chat [--model ID] [--system TEXT] [--max-tokens N] [--no-history] [--url http://127.0.0.1:8787/v1]
-                                         terminal chat with the running local API (key from $HUB_API_KEY or prompt)
+                                         terminal chat with the running local API (key from $HUB_API_KEY or a
+                                         hidden prompt); Ctrl-C stops a reply, at the prompt it ends the chat
   history status | on | off | retention <days|none> | list | show <id> | delete <id> --yes
   workspace list | create <name> [--quota-mb N] | files <ws>
   workspace put <ws> <file> [--as REL] [--overwrite] | get <ws> <rel> <dest> [--overwrite]
-  workspace rm <ws> <rel> --yes | delete <ws> --yes | export <ws> <dest.zip>
+  workspace rm <ws> <rel> --yes | delete <ws> --yes | export <ws> <dest.zip> [--overwrite]
   backup <dest.db>                       consistent database snapshot (no keys, no request log)
   help | --help | -h                     show this text and do nothing else
 
@@ -452,8 +453,8 @@ async fn run() -> Result<()> {
             if sub != "set" || name != "tunnel_token" {
                 return Err(usage_error("only `secret set tunnel_token` is supported"));
             }
-            let mut v = String::new();
-            std::io::stdin().read_line(&mut v)?;
+            let mut intr = local::Interrupt::new()?;
+            let v = local::read_secret_line("tunnel token (typing is hidden): ", &mut intr).await?;
             let v = v.trim();
             if v.is_empty() {
                 bail!("no token on stdin; nothing stored");
@@ -557,13 +558,15 @@ impl ServeOpts {
 /// the terminal's signals; Ctrl-C, Ctrl-Break and console close on Windows, where the Job
 /// Object also ends the tree if Windows does not wait for the orderly stop. Installed before
 /// the engine starts, so a stop request during a long model load still stops the engine.
+/// A SIGHUP that was already ignored when hubd started (`nohup hubd serve &`, a supervisor)
+/// stays ignored: listening for it would replace that SIG_IGN and end serving at logout.
 struct Shutdown {
     #[cfg(unix)]
     sigint: tokio::signal::unix::Signal,
     #[cfg(unix)]
     sigterm: tokio::signal::unix::Signal,
     #[cfg(unix)]
-    sighup: tokio::signal::unix::Signal,
+    sighup: Option<tokio::signal::unix::Signal>,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
@@ -576,19 +579,36 @@ impl Shutdown {
     #[cfg(unix)]
     fn install() -> Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
+        let sighup = if sighup_ignored() {
+            say!("note: SIGHUP is ignored (nohup); closing the terminal does not stop serving");
+            None
+        } else {
+            Some(signal(SignalKind::hangup())?)
+        };
         Ok(Self {
             sigint: signal(SignalKind::interrupt())?,
             sigterm: signal(SignalKind::terminate())?,
-            sighup: signal(SignalKind::hangup())?,
+            sighup,
         })
     }
 
     #[cfg(unix)]
     async fn recv(&mut self) -> &'static str {
+        let Self {
+            sigint,
+            sigterm,
+            sighup,
+        } = self;
+        let hup = async {
+            match sighup {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
-            _ = self.sigint.recv() => "SIGINT",
-            _ = self.sigterm.recv() => "SIGTERM",
-            _ = self.sighup.recv() => "SIGHUP",
+            _ = sigint.recv() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+            _ = hup => "SIGHUP",
         }
     }
 
@@ -609,6 +629,17 @@ impl Shutdown {
             _ = self.ctrl_break.recv() => "Ctrl-Break",
             _ = self.ctrl_close.recv() => "console close",
         }
+    }
+}
+
+/// True if this process started with SIGHUP set to SIG_IGN (what `nohup` does).
+#[cfg(unix)]
+fn sighup_ignored() -> bool {
+    // SAFETY: a null new action only reads the current disposition into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
     }
 }
 

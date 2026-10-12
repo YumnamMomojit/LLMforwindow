@@ -5,12 +5,15 @@
   hub.db (+ -wal/-shm)            keys (verifiers), models catalog, settings, request log, workspaces, files, conversations
   secrets\                        DPAPI-protected blobs (dev: 0600 files)
   workspaces\<16-hex id>\...      user files (one folder per workspace); .tmp-uploads cleaned at start
+  workspaces.lock                 held by each `hubd workspace`/`backup` command, so they run one at a time (the start-up
+                                  clean-up would otherwise delete the upload of a `workspace put` still running elsewhere)
   exports\  cache\  logs\         reserved areas (created by `hubd init`)
 <models root, user-chosen>        model weights are referenced in place, never copied or deleted
 ```
 SQLite: WAL, `PRAGMA user_version` migrations (v2 now); a newer DB than the app refuses to open. Binary files are on disk, never blobs.
 Quota per workspace and a free-space reserve are enforced during streaming writes. Export = zip (`metadata.json` + `files/...`, no models, no secrets).
 Database backup = `VACUUM INTO` snapshot with `api_keys`/`request_log` removed. No automatic/cloud/encrypted backup and no secure erase (SSD) in v1.
-Removing a model from the catalog never deletes user files. Destructive workspace operations require an explicit `confirmed=true`.
+Removing a model from the catalog never deletes user files. Destructive workspace operations require an explicit `confirmed=true`
+(`--yes` on the CLI); `workspace get` and `workspace export` never replace an existing file without `--overwrite`.
 Inference keys cannot reach any storage function: the gateway has no such route.
 Not built yet: storage UI, configurable roots in a config file, drive/quota settings screen.

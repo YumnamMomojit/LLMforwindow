@@ -11,9 +11,11 @@ programs can use, and local file workspaces.
 Honest status of this download:
   * It is a command-line program (hubd.exe, started through hub.cmd). There is
     no graphical window yet.
-  * It is NOT code-signed. Windows or your antivirus may warn about it. Compare
-    the files with SHA256SUMS.txt (PowerShell: Get-FileHash .\hubd.exe) and only
-    continue if you trust where you got it.
+  * It is NOT code-signed. Windows or your antivirus may warn about it. Before
+    unzipping, compare the zip's SHA-256 with the value published next to the
+    download (PowerShell: Get-FileHash LocalAIHub-0.1.0-windows-x64.zip) and only
+    continue if you trust where you got it. SHA256SUMS.txt inside the folder only
+    shows whether a file was damaged; anyone who changed the files could change it too.
   * hubd.exe was cross-compiled and tested under Wine and on Linux with the real
     Colibri engine. It has NOT yet been run on a real Windows PC. Please report
     anything that fails.
@@ -79,12 +81,17 @@ STEP 5  Chat
 ------------
 Open a SECOND Command Prompt in this folder:
 
-   set HUB_API_KEY=lah_...your key...
    hub.cmd chat
 
+It asks for your lah_... key: paste it and press Enter (the key is not shown while
+you type or paste). To skip that question in this window, first run
+   set HUB_API_KEY=lah_...your key...
+If serve runs on another port (--port 8788): hub.cmd chat --url http://127.0.0.1:8788/v1
+
 Commands inside chat: /new (fresh conversation), /system TEXT, /exit.
-Ctrl+C stops a reply. Conversations are saved locally unless you run
-"hub.cmd history off" (see "hub.cmd history status").
+Ctrl+C stops a reply; at the > prompt it ends the chat. Conversations are saved
+locally unless you run "hub.cmd history off" or start with "hub.cmd chat --no-history"
+(see "hub.cmd history status" and "hub.cmd history list").
 
 
 STEP 6  Use the model from another program
@@ -106,6 +113,7 @@ STEP 7  Save files locally
    hub.cmd workspace files "Project A"
    hub.cmd workspace get "Project A" report.pdf C:\Users\me\Desktop\report.pdf
    hub.cmd workspace export "Project A" C:\Users\me\Desktop\project-a.zip
+get and export never replace an existing file; add --overwrite to replace it.
 Files are stored under %LOCALAPPDATA%\LocalAIHub\workspaces. API keys cannot reach them.
 
 
@@ -121,7 +129,10 @@ If something goes wrong
   hub.cmd check                       what was found
   "Not enough memory ..."             close programs, pick a smaller model, or set
                                       RAM_GB=<gigabytes> before hub.cmd serve
-  "port ... already in use"           hub.cmd serve --model my-model --port 8788
+  "port 8787 on 127.0.0.1 is not      hub.cmd serve --model my-model --port 8788
+   available"                         (then: hub.cmd chat --url http://127.0.0.1:8788/v1)
+  "Terminate batch job (Y/N)?"        Command Prompt asks this after Ctrl+C was pressed
+                                      while hub.cmd ran; Y and N are both fine
   model validate says "not supported" that model family/format is not served by
                                       this Colibri version (GGUF is not supported)
 Full documentation: docs\ (WINDOWS.md, API.md, SECURITY.md, STORAGE.md, VERIFICATION.md).

@@ -2,6 +2,7 @@
 //! missing). The fake starts a child that stands in for the C engine, in the launcher's
 //! process group like the real one, and records both pids. Checked: every stop request
 //! (SIGINT, SIGTERM, SIGHUP) during a model load and while serving tears the whole tree down;
+//! a SIGHUP ignored from the start (nohup) stays ignored;
 //! failures that do not need the engine are reported before it starts; engine start failures
 //! exit nonzero with the actionable message. Linux only (process liveness is read from /proc);
 //! on Windows the Job Object owns the tree and the console events are not tested here.
@@ -163,7 +164,27 @@ fn collect(r: impl Read + Send + 'static, buf: Arc<Mutex<String>>) {
 
 impl Fixture {
     fn serve(&self, mode: &str, port: u16, extra: &[&str]) -> Served {
-        let mut child = hubd(&self.data)
+        self.serve_with(mode, port, extra, false)
+    }
+
+    /// `ignore_hup`: start hubd with SIGHUP already ignored, as `nohup` does; otherwise with
+    /// the default disposition, even if the test run itself was started under nohup.
+    fn serve_with(&self, mode: &str, port: u16, extra: &[&str], ignore_hup: bool) -> Served {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = hubd(&self.data);
+        let disposition = if ignore_hup {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        // SAFETY: only the async-signal-safe signal(2) runs between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::signal(libc::SIGHUP, disposition);
+                Ok(())
+            });
+        }
+        let mut child = cmd
             .args([
                 "serve",
                 "--model",
@@ -348,6 +369,83 @@ fn sigterm_while_serving_stops_the_engine_tree() {
 #[test]
 fn sighup_while_serving_stops_the_engine_tree() {
     stop_while_serving("HUP");
+}
+
+/// The SIGHUP disposition hubd currently has, from /proc: ignored, caught, or default.
+fn sighup_disposition(pid: u32) -> &'static str {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let mask = |name: &str| {
+        let v = status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap()
+            .trim();
+        u64::from_str_radix(v, 16).unwrap()
+    };
+    if mask("SigIgn:") & 1 != 0 {
+        "ignored"
+    } else if mask("SigCgt:") & 1 != 0 {
+        "caught"
+    } else {
+        "default"
+    }
+}
+
+/// `nohup hubd serve &`: an inherited SIG_IGN for SIGHUP is kept, so a hangup (logout, closed
+/// SSH session) does not stop serving; SIGTERM still stops everything.
+#[test]
+fn sighup_ignored_by_nohup_stays_ignored() {
+    let Some(f) = fixture("nohup") else {
+        return;
+    };
+    let mut s = f.serve_with("serve", 0, &[], true);
+    let pids = s.wait_for_engine();
+    assert!(
+        wait_until(Duration::from_secs(30), || s
+            .out()
+            .contains("Ctrl-C to stop")),
+        "not ready\nstdout: {}\nstderr: {}",
+        s.out(),
+        s.err()
+    );
+    s.signal("HUP");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        s.child.try_wait().unwrap().is_none(),
+        "hubd stopped on an ignored SIGHUP\nstdout: {}",
+        s.out()
+    );
+    assert!(!s.out().contains("SIGHUP received"), "{}", s.out());
+    assert!(pids.iter().all(|&p| alive(p)), "the engine was stopped");
+    assert_eq!(sighup_disposition(s.child.id()), "ignored");
+    assert!(s.out().contains("SIGHUP is ignored"), "{}", s.out());
+    s.signal("TERM");
+    let status = s.wait_exit();
+    assert!(status.success(), "{status}\n{}", s.err());
+    assert_tree_gone(&pids);
+}
+
+/// Without nohup, hubd catches SIGHUP (and stops on it: sighup_while_serving_...).
+#[test]
+fn sighup_is_caught_when_not_ignored() {
+    let Some(f) = fixture("hup-caught") else {
+        return;
+    };
+    let mut s = f.serve("serve", 0, &[]);
+    let pids = s.wait_for_engine();
+    assert!(
+        wait_until(Duration::from_secs(30), || s
+            .out()
+            .contains("Ctrl-C to stop")),
+        "not ready\nstdout: {}\nstderr: {}",
+        s.out(),
+        s.err()
+    );
+    assert_eq!(sighup_disposition(s.child.id()), "caught");
+    assert!(!s.out().contains("SIGHUP is ignored"), "{}", s.out());
+    s.signal("TERM");
+    assert!(s.wait_exit().success());
+    assert_tree_gone(&pids);
 }
 
 #[test]

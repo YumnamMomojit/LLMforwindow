@@ -17,7 +17,10 @@
    Engine/tunnel log tails are redacted of the internal key / tunnel token. Retention via `hubd purge` (30 days default for request log).
 7. **Filesystem**: all workspace I/O through `storage.rs` (component allowlist, Windows reserved names, ADS `:` rejected, symlink/reparse-point
    ancestors rejected, canonical-prefix check, atomic temp+rename, quota & free-space reserve during write). Uploaded files are never extracted or executed.
-8. **Model output is inert text** (history export is plain text). Tool calls are rejected at the gateway.
+8. **Model output is inert text** (history export is plain text). Tool calls are rejected at the gateway. `hubd chat` and
+   `hubd history` strip terminal control characters (C0/C1, so no escape sequences) from replies, thinking, server error messages,
+   model ids and conversation titles before printing them. `hubd chat` sends its key only to plain-http loopback URLs
+   (`localhost` is pinned to 127.0.0.1/::1, no proxy, redirects are never followed); keys and the tunnel token typed at a terminal are not echoed.
 
 ## Threat model (honest limits)
 * Protects against: remote clients with leaked/revoked/expired/no keys; clients probing admin/upstream routes; oversized/malformed

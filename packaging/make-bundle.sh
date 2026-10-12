@@ -4,7 +4,12 @@
 #   dist/LocalAIHub-<ver>-linux-x64.tar.gz  (hubd)
 # Needs: rustup target x86_64-pc-windows-gnu, x86_64-w64-mingw32-gcc, cargo-about (--features cli).
 # The Colibri engine and Python are NOT bundled: the user adds the official release (README-FIRST.txt).
+# Reproducible: the same commit and toolchain give the same archives, wherever and whenever they are built.
+# Every date is the commit's (SOURCE_DATE_EPOCH), build paths are remapped out of the binaries, the
+# Windows linker writes no timestamp, and archive entries have fixed order, owners, modes and times.
 set -euo pipefail
+export LC_ALL=C TZ=UTC
+umask 022
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -12,9 +17,15 @@ OUT="$ROOT/dist"
 command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "missing x86_64-w64-mingw32-gcc"; exit 1; }
 cargo about --version >/dev/null 2>&1 || { echo "missing cargo-about (cargo install cargo-about --locked --features cli)"; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean; commit first so BUILDINFO names the real source"; exit 1; }
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
 
-cargo build --release --locked -p hubd --target x86_64-pc-windows-gnu
-cargo build --release --locked -p hubd
+# Rust flags for these builds only (this replaces any RUSTFLAGS of the environment); \x1f-separated so
+# that paths with spaces survive.
+flags() { local IFS=$'\x1f'; echo "$*"; }
+REMAP=("--remap-path-prefix=$ROOT=/build/local-ai-hub" "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo")
+CARGO_ENCODED_RUSTFLAGS="$(flags "${REMAP[@]}" -C link-arg=-Wl,--no-insert-timestamp)" \
+  cargo build --release --locked -p hubd --target x86_64-pc-windows-gnu
+CARGO_ENCODED_RUSTFLAGS="$(flags "${REMAP[@]}")" cargo build --release --locked -p hubd
 rm -rf "$OUT"; mkdir -p "$OUT"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cargo about generate --locked -c packaging/about.toml -m crates/hubd/Cargo.toml packaging/about.hbs -o "$TMP/THIRD-PARTY-LICENSES.txt"
@@ -29,7 +40,7 @@ stage() { # stage <dir> <os>
   cp LICENSE NOTICE "$d/"
   if [ "$os" = windows ]; then
     cp target/x86_64-pc-windows-gnu/release/hubd.exe "$d/"
-    cp packaging/hub.cmd "$d/"
+    crlf packaging/hub.cmd "$d/hub.cmd"   # cmd.exe misreads labels in LF-only batch files
     crlf packaging/README-FIRST.txt "$d/README-FIRST.txt"
     crlf "$TMP/THIRD-PARTY-LICENSES.txt" "$d/THIRD-PARTY-LICENSES.txt"
     printf 'Unzip the official Colibri v2.0.0 Windows release here (see README-FIRST.txt, step 2).\r\n' > "$d/colibri/PUT-COLIBRI-HERE.txt"
@@ -42,7 +53,7 @@ stage() { # stage <dir> <os>
   {
     echo "Local AI Hub $VER ($os x64)"
     echo "source commit: $(git rev-parse HEAD)"
-    echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) with $(rustc --version)"
+    echo "source date: $(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ); built with $(rustc --version)"
     echo "target: $([ "$os" = windows ] && echo x86_64-pc-windows-gnu || echo x86_64-unknown-linux-gnu)"
     echo "Colibri pin: v2.0.0 bf2442915d6e3dd4cdfd2eb9c2a3d2aa44a25850 (not included)"
     echo "code signing: none (unsigned)"
@@ -53,20 +64,28 @@ stage() { # stage <dir> <os>
 W="LocalAIHub-$VER-windows-x64"; L="LocalAIHub-$VER-linux-x64"
 stage "$TMP/$W" windows
 stage "$TMP/$L" linux
-# Deterministic order; the zip keeps one top-level folder.
-(cd "$TMP" && python3 - "$W" "$OUT/$W.zip" <<'PY'
-import os, sys, zipfile
-root, out = sys.argv[1], sys.argv[2]
+# Deterministic order, times and modes; the zip keeps one top-level folder.
+(cd "$TMP" && python3 -I - "$W" "$OUT/$W.zip" "$SOURCE_DATE_EPOCH" <<'PY'
+import os, sys, time, zipfile
+root, out, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+stamp = time.gmtime(max(epoch, 315532800))[:6]  # zip dates start in 1980
+def entry(name, mode):
+    i = zipfile.ZipInfo(name, stamp)
+    i.create_system, i.external_attr = 3, mode << 16
+    i.compress_type = zipfile.ZIP_DEFLATED
+    return i
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for d, dirs, files in sorted(os.walk(root)):
-        dirs.sort()
         for f in sorted(files):
             p = os.path.join(d, f)
-            z.write(p, p.replace(os.sep, "/"))
+            mode = 0o100755 if os.access(p, os.X_OK) else 0o100644
+            with open(p, "rb") as fh:
+                z.writestr(entry(p.replace(os.sep, "/"), mode), fh.read(), compresslevel=9)
         if not files and not dirs:
-            z.writestr(d.replace(os.sep, "/") + "/", "")
+            z.writestr(entry(d.replace(os.sep, "/") + "/", 0o40755), b"")
 PY
 )
-tar -C "$TMP" --owner=0 --group=0 --sort=name -czf "$OUT/$L.tar.gz" "$L"
+tar -C "$TMP" --format=gnu --owner=0 --group=0 --numeric-owner --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
+  --mode='go-w' -cf - "$L" | gzip -n -9 > "$OUT/$L.tar.gz"
 (cd "$OUT" && sha256sum "$W.zip" "$L.tar.gz" > SHA256SUMS.txt)
 ls -l "$OUT"; cat "$OUT/SHA256SUMS.txt"

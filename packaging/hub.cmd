@@ -4,7 +4,9 @@ rem arguments. HUB_PYTHON / HUB_COLIBRI_DIR (or --python / --colibri-dir) always
 rem   hub.cmd check     shows what was found
 rem   hub.cmd --help    lists every command
 rem No parenthesised blocks around paths: "C:\Program Files (x86)\..." would end them early.
-setlocal EnableExtensions
+rem Delayed expansion stays off even if the registry turns it on: it would eat every ! in a
+rem path or argument (--system "Be brief!").
+setlocal EnableExtensions DisableDelayedExpansion
 set "HUB_HOME=%~dp0"
 
 if defined HUB_PYTHON goto :have_python
@@ -31,28 +33,55 @@ popd
 :have_colibri
 
 if /i "%~1"=="check" goto :check
+if "%~1"=="" goto :no_args
+rem After Ctrl+C, cmd may ask "Terminate batch job (Y/N)?" once hubd.exe has finished; either answer is fine.
 "%HUB_HOME%hubd.exe" %*
 exit /b %ERRORLEVEL%
 
+rem Started without a command, e.g. by a double-click: show the help and keep the window open.
+:no_args
+"%HUB_HOME%hubd.exe" --help
+echo.
+echo Run hub.cmd from a Command Prompt opened in this folder; start with: hub.cmd check
+echo (README-FIRST.txt explains every step.)
+pause
+exit /b 0
+
 :check
 echo Local AI Hub setup check
+set "HUB_CHECK_FAILED="
+if exist "%HUB_HOME%hubd.exe" goto :have_hubd
+echo   hubd.exe : NOT FOUND next to hub.cmd. Unzip the whole Local AI Hub folder again.
+set "HUB_CHECK_FAILED=1"
+goto :check_python
+:have_hubd
 echo   hubd.exe : "%HUB_HOME%hubd.exe"
+:check_python
 if not defined HUB_PYTHON goto :no_python
 echo   Python   : "%HUB_PYTHON%"
-"%HUB_PYTHON%" --version
+rem Run it: a broken or too old Python would otherwise only fail when serving starts.
+"%HUB_PYTHON%" -c "import sys; assert sys.version_info >= (3, 10); print('             version ' + sys.version.split()[0])"
+if not errorlevel 1 goto :check_colibri
+echo              does NOT run, or is older than 3.10. README-FIRST.txt step 1.
+set "HUB_CHECK_FAILED=1"
 goto :check_colibri
 :no_python
 echo   Python   : NOT FOUND. Install Python 3.10 or newer from https://www.python.org/downloads/
 echo              (tick "Add python.exe to PATH"), then run hub.cmd check again. README-FIRST.txt step 1.
+set "HUB_CHECK_FAILED=1"
 :check_colibri
 if not defined HUB_COLIBRI_DIR goto :no_colibri
 echo   Colibri  : "%HUB_COLIBRI_DIR%"
+if exist "%HUB_COLIBRI_DIR%\openai_server.py" goto :check_done
+if exist "%HUB_COLIBRI_DIR%\c\openai_server.py" goto :check_done
+echo              has no openai_server.py. README-FIRST.txt step 2.
+set "HUB_CHECK_FAILED=1"
 goto :check_done
 :no_colibri
 echo   Colibri  : NOT FOUND. Unzip the official Colibri v2.0.0 Windows release into
 echo              "%HUB_HOME%colibri" so that openai_server.py is inside it. README-FIRST.txt step 2.
+set "HUB_CHECK_FAILED=1"
 :check_done
-if not defined HUB_PYTHON exit /b 1
-if not defined HUB_COLIBRI_DIR exit /b 1
+if defined HUB_CHECK_FAILED exit /b 1
 echo Ready. Next: hub.cmd init, then add a model (README-FIRST.txt step 3).
 exit /b 0

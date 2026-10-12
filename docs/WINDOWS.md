@@ -18,8 +18,10 @@ cargo build --release -p hubd
 `hubd.exe`; Python 3.10+ (embeddable distribution or system); the upstream **Windows release archive** for v2.0.0 (engines `.exe`, `shaders\`, and `openai_server.py`
 with the Python it imports, all flat at the archive root, with `LICENSE`/`NOTICE`/`THIRD_PARTY_NOTICES.md`) — **verify its SHA-256 yourself against a value you trust before bundling**; model weights are separate.
 WebView2 is needed only for the future Tauri shell. `packaging/build-portable.ps1` assembles a portable folder from those pieces (UNTESTED):
-it always rebuilds `hubd.exe`, refuses to package after a failed build, empties its own output folder first, and writes `hub.cmd`, which runs
-`hubd.exe` with the bundled Python and Colibri. Unverified: the embeddable Python's `python3XX._pth` may stop `openai_server.py` from
+it always rebuilds `hubd.exe` and packages the exact file cargo reports for that build (so `CARGO_TARGET_DIR`, `build.target-dir` and
+`build.target` cannot make it ship an older binary), refuses to package after a failed build, assembles the bundle in `<Out>.partial` and
+replaces its own previous output folder only once the new one is complete, takes every path literally (`[`/`]` are not wildcards), and writes
+`hub.cmd`, which runs `hubd.exe` with the bundled Python and Colibri. Unverified: the embeddable Python's `python3XX._pth` may stop `openai_server.py` from
 importing its own folder; if `serve` fails with `ModuleNotFoundError`, try a full Python install.
 
 ## First run, models
@@ -40,8 +42,8 @@ upstream README: Qwen3-Coder-30B-A3B (19 GB download, RAM 8/18 GB), OLMoE-7B (ne
 (use upstream `coli setup`, which asks before downloading); the Hub only warns about RAM/disk with labelled estimates.
 
 ## Lifecycle
-Serving lasts while `hubd serve` runs. Ctrl-C, Ctrl-Break or closing the console window (SIGINT/SIGTERM/SIGHUP on Linux/macOS) stops
-tunnel → gateway → engine tree, also during the model load; if Windows ends `hubd` before that finishes (console close allows only a few
+Serving lasts while `hubd serve` runs. Ctrl-C, Ctrl-Break or closing the console window (SIGINT/SIGTERM/SIGHUP on Linux/macOS; a SIGHUP
+already ignored at start, as under `nohup`, stays ignored) stops tunnel → gateway → engine tree, also during the model load; if Windows ends `hubd` before that finishes (console close allows only a few
 seconds), the Job Object still ends the engine tree. Verified on Linux only; the Windows console events and the Job Object are untested.
 No Windows service, no autostart, no tray yet. Upgrade = replace `hubd.exe`; `hub.db` migrates forward in a transaction; data and models are left alone.
 Uninstall must keep `%LOCALAPPDATA%\LocalAIHub` by default. Signing: none; installers/binaries here are **unsigned** — SmartScreen will warn. Signing needs

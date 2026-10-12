@@ -476,12 +476,15 @@ name = "hubd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs4",
  "futures-util",
  "hub-core",
+ "libc",
  "reqwest",
  "serde_json",
  "tokio",
  "url",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

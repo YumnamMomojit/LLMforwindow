@@ -12,7 +12,10 @@ The Hub never opens router ports, uses UPnP, or touches Windows Firewall.
 ## Chosen deployment path: named Cloudflare Tunnel (remotely managed) — NOT live-tested
 1. Own a domain on Cloudflare; create a named tunnel in Zero Trust → Networks → Tunnels; add a public hostname
    `api.example.com` → service `http://127.0.0.1:8787`; copy the tunnel token.
-2. `echo <token> | hubd secret set tunnel_token` (an empty token is refused); install `cloudflared` yourself (the Hub does not download it).
+2. `hubd secret set tunnel_token`, then paste the token at the prompt: typing is not echoed, so it stays off the screen and out of the
+   scrollback (Ctrl-C cancels and stores nothing). It also reads a pipe (`hubd secret set tunnel_token < token.txt`); avoid
+   `echo <token> | ...`, which leaves the token in the shell history. An empty token is refused. Install `cloudflared` yourself (the Hub
+   does not download it).
 3. `hubd serve --model ID --colibri-dir C --share --cloudflared C:\path\cloudflared.exe --hostname api.example.com --i-authorize-public-sharing`.
    The token and the cloudflared path are checked before the model loads. hubd then prints the sharing state as it changes:
    `sharing: CONNECTING`, `CONNECTED` once cloudflared logs a registered connection, or `FAILED` (nothing is published, the local API keeps
