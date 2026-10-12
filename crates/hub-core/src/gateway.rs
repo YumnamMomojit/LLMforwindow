@@ -33,6 +33,8 @@ pub struct GatewayConfig {
     pub model_id: String,
     pub db_path: PathBuf,
     pub max_body_bytes: usize,
+    /// Max time to receive the request body once headers are in (trickling clients).
+    pub body_read_timeout_secs: u64,
     pub max_messages: usize,
     /// Simultaneous generations. Colibri serves one at a time; keep 1 unless verified.
     pub max_active: usize,
@@ -63,6 +65,7 @@ impl Default for GatewayConfig {
             model_id: "local-model".into(),
             db_path: PathBuf::from("hub.db"),
             max_body_bytes: 1 << 20,
+            body_read_timeout_secs: 30,
             max_messages: 256,
             max_active: 1,
             max_queue: 4,
@@ -366,6 +369,15 @@ impl Drop for ActiveGuard {
     }
 }
 
+/// Holds one place in `waiting`. A client that disconnects while queued drops the handler
+/// future mid-await, so the release must happen in Drop or the place leaks for good.
+struct WaitGuard<'a>(&'a Inner);
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, SeqCst);
+    }
+}
+
 fn host_allowed(cfg: &GatewayConfig, headers: &HeaderMap) -> bool {
     if cfg.allowed_hosts.is_empty() {
         return true;
@@ -623,13 +635,12 @@ pub fn sanitize_chat_request(v: Value, cfg: &GatewayConfig) -> Result<(Value, bo
             }
         }
     }
+    let stop_ok = |s: &str| !s.is_empty() && s.len() <= 64;
     match obj.get("stop") {
         None | Some(Value::Null) => {}
-        Some(Value::String(s)) => out["stop"] = json!([s]),
+        Some(Value::String(s)) if stop_ok(s) => out["stop"] = json!([s]),
         Some(Value::Array(a))
-            if a.len() <= 4
-                && a.iter()
-                    .all(|s| s.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) =>
+            if a.len() <= 4 && a.iter().all(|s| s.as_str().is_some_and(stop_ok)) =>
         {
             out["stop"] = Value::Array(a.clone())
         }
@@ -665,8 +676,9 @@ async fn admit(inner: &Arc<Inner>) -> Result<Admission, ApiError> {
     if let Ok(p) = inner.sem.clone().try_acquire_owned() {
         return Ok(Admission::Granted(p, 0));
     }
-    if inner.waiting.fetch_add(1, SeqCst) >= inner.cfg.max_queue {
-        inner.waiting.fetch_sub(1, SeqCst);
+    let ahead = inner.waiting.fetch_add(1, SeqCst);
+    let queued = WaitGuard(inner);
+    if ahead >= inner.cfg.max_queue {
         let mut e = ApiError::new(
             429,
             "rate_limit_error",
@@ -681,7 +693,7 @@ async fn admit(inner: &Arc<Inner>) -> Result<Admission, ApiError> {
         inner.sem.clone().acquire_owned(),
     )
     .await;
-    inner.waiting.fetch_sub(1, SeqCst);
+    drop(queued);
     match r {
         Ok(Ok(p)) => Ok(Admission::Granted(p, t0.elapsed().as_millis() as i64)),
         _ => {
@@ -753,16 +765,27 @@ async fn chat(inner: Arc<Inner>, req: Request) -> Result<Response, ApiError> {
             "Content-Type must be application/json.",
         ));
     }
-    let body = axum::body::to_bytes(req.into_body(), inner.cfg.max_body_bytes)
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                413,
-                "invalid_request_error",
-                "request_too_large",
-                format!("Request body exceeds {} bytes.", inner.cfg.max_body_bytes),
-            )
-        })?;
+    let body = tokio::time::timeout(
+        Duration::from_secs(inner.cfg.body_read_timeout_secs),
+        axum::body::to_bytes(req.into_body(), inner.cfg.max_body_bytes),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            408,
+            "invalid_request_error",
+            "request_timeout",
+            "Timed out reading the request body.",
+        )
+    })?
+    .map_err(|_| {
+        ApiError::new(
+            413,
+            "invalid_request_error",
+            "request_too_large",
+            format!("Request body exceeds {} bytes.", inner.cfg.max_body_bytes),
+        )
+    })?;
     let parsed: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::bad("invalid_json", "Body is not valid JSON."))?;
     let (up_body, stream) = sanitize_chat_request(parsed, &inner.cfg)?;
@@ -832,6 +855,8 @@ async fn chat(inner: Arc<Inner>, req: Request) -> Result<Response, ApiError> {
             return Err(e);
         }
         let v: Value = serde_json::from_slice(&b).map_err(|_| {
+            log.status = 502;
+            log.outcome = "engine_error";
             ApiError::new(
                 502,
                 "server_error",
@@ -854,6 +879,41 @@ fn sse_error(e: &ApiError) -> Bytes {
     Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", e.body()))
 }
 
+type FrameTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+/// Queue one frame for the client, waiting at most `limit` for room. A client that stops
+/// reading must not keep the generation slot, so a channel that stays full that long counts
+/// as the client having left. The error is the log outcome.
+async fn send_frame(tx: &FrameTx, frame: Bytes, limit: Duration) -> Result<(), &'static str> {
+    match tokio::time::timeout(limit, tx.send(Ok(frame))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err("cancelled"),
+        Err(_) => Err("client_stalled"),
+    }
+}
+
+/// Upstream error bodies are only parsed for their message: read at most 64 KiB of one.
+async fn capped_body(resp: reqwest::Response) -> Vec<u8> {
+    let mut s = resp.bytes_stream();
+    let mut b = Vec::new();
+    while let Some(Ok(c)) = s.next().await {
+        b.extend_from_slice(&c);
+        if b.len() >= 64 << 10 {
+            break;
+        }
+    }
+    b
+}
+
+/// True if the last non-blank SSE line is the `[DONE]` sentinel.
+fn ends_with_done(tail: &str) -> bool {
+    tail.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .and_then(|l| l.strip_prefix("data:"))
+        .is_some_and(|d| d.trim() == "[DONE]")
+}
+
 fn stream_response(
     inner: Arc<Inner>,
     payload: Vec<u8>,
@@ -864,7 +924,19 @@ fn stream_response(
     tokio::spawn(async move {
         let _permit = permit;
         let _active = ActiveGuard::new(&inner);
-        let deadline = Instant::now() + Duration::from_secs(inner.cfg.request_deadline_secs);
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(inner.cfg.request_deadline_secs);
+        // Also bounds every send to the client and the upstream error-body read, so neither a
+        // client that stops reading nor a wedged upstream can outlast the deadlines by more.
+        let idle = Duration::from_secs(inner.cfg.stream_idle_timeout_secs);
+        let waited_too_long = || {
+            ApiError::new(
+                504,
+                "server_error",
+                "deadline_exceeded",
+                "Timed out waiting for the model.",
+            )
+        };
         let url = format!(
             "{}/v1/chat/completions",
             inner.cfg.upstream.trim_end_matches('/')
@@ -877,8 +949,11 @@ fn stream_response(
             .body(payload)
             .send();
         tokio::pin!(send);
-        let first_deadline =
-            tokio::time::sleep(Duration::from_secs(inner.cfg.first_byte_timeout_secs));
+        // One absolute deadline for upstream headers and the first body byte together, armed
+        // once here so keepalive ticks can never restart it.
+        let first_deadline = tokio::time::sleep_until(
+            (start + Duration::from_secs(inner.cfg.first_byte_timeout_secs)).min(deadline),
+        );
         tokio::pin!(first_deadline);
         let mut ka = tokio::time::interval(Duration::from_secs(inner.cfg.keepalive_secs.max(1)));
         ka.tick().await;
@@ -887,11 +962,16 @@ fn stream_response(
         let resp = loop {
             tokio::select! {
                 r = &mut send => break r,
-                _ = ka.tick() => { if tx.send(Ok(Bytes::from_static(b": keepalive\n\n"))).await.is_err() { return; } }
+                _ = ka.tick() => {
+                    if let Err(o) = send_frame(&tx, Bytes::from_static(b": keepalive\n\n"), idle).await {
+                        log.outcome = o;
+                        return;
+                    }
+                }
                 _ = tx.closed() => return, // client left: dropping `send` cancels upstream
                 _ = &mut first_deadline => {
                     log.status = 504; log.outcome = "deadline";
-                    let _ = tx.send(Ok(sse_error(&ApiError::new(504, "server_error", "deadline_exceeded", "Timed out waiting for the model.")))).await;
+                    let _ = send_frame(&tx, sse_error(&waited_too_long()), idle).await;
                     return;
                 }
             }
@@ -901,108 +981,111 @@ fn stream_response(
             Err(_) => {
                 log.status = 502;
                 log.outcome = "engine_error";
-                let _ = tx
-                    .send(Ok(sse_error(&ApiError::new(
-                        502,
-                        "server_error",
-                        "engine_error",
-                        "The model engine is unreachable.",
-                    ))))
-                    .await;
+                let e = ApiError::new(
+                    502,
+                    "server_error",
+                    "engine_error",
+                    "The model engine is unreachable.",
+                );
+                let _ = send_frame(&tx, sse_error(&e), idle).await;
                 return;
             }
         };
         let st = resp.status().as_u16();
         if !(200..300).contains(&st) {
-            let b = resp.bytes().await.unwrap_or_default();
+            let b = tokio::time::timeout(idle, capped_body(resp))
+                .await
+                .unwrap_or_default();
             let e = upstream_error(st, &b);
             log.status = e.status.as_u16();
             log.outcome = "upstream_error";
-            let _ = tx.send(Ok(sse_error(&e))).await;
+            let _ = send_frame(&tx, sse_error(&e), idle).await;
             return;
         }
         log.status = 200;
         let mut up = resp.bytes_stream();
-        let idle = Duration::from_secs(inner.cfg.stream_idle_timeout_secs);
         let mut tail: Vec<u8> = Vec::new();
         let mut first = true;
+        let total = tokio::time::sleep_until(deadline);
+        tokio::pin!(total);
+        // Re-armed on every chunk and only polled once the first byte is in.
+        let stall = tokio::time::sleep(idle);
+        tokio::pin!(stall);
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                log.outcome = "deadline";
-                let _ = tx
-                    .send(Ok(sse_error(&ApiError::new(
+            // Before the first body byte the first-byte deadline applies and SSE comments keep
+            // intermediaries alive; afterwards each chunk must follow within the idle timeout.
+            let next = tokio::select! {
+                n = up.next() => n,
+                _ = tx.closed() => return,
+                _ = ka.tick(), if first => {
+                    if let Err(o) = send_frame(&tx, Bytes::from_static(b": keepalive\n\n"), idle).await {
+                        log.outcome = o;
+                        return;
+                    }
+                    continue;
+                }
+                _ = &mut first_deadline, if first => {
+                    log.outcome = "deadline";
+                    let _ = send_frame(&tx, sse_error(&waited_too_long()), idle).await;
+                    return;
+                }
+                _ = &mut stall, if !first => {
+                    log.outcome = "idle_timeout";
+                    let e = ApiError::new(
+                        504,
+                        "server_error",
+                        "stream_stalled",
+                        "The model stopped producing output.",
+                    );
+                    let _ = send_frame(&tx, sse_error(&e), idle).await;
+                    return;
+                }
+                _ = &mut total => {
+                    log.outcome = "deadline";
+                    let e = ApiError::new(
                         504,
                         "server_error",
                         "deadline_exceeded",
                         "The stream exceeded its deadline.",
-                    ))))
-                    .await;
-                return;
-            }
-            // Before the first body byte the wait is the (long) first-byte timeout and SSE
-            // comments keep intermediaries alive; afterwards the idle timeout applies.
-            let wait = if first {
-                Duration::from_secs(inner.cfg.first_byte_timeout_secs)
-            } else {
-                idle
-            };
-            let next = loop {
-                tokio::select! {
-                    n = tokio::time::timeout(wait.min(remaining), up.next()) => break n,
-                    _ = tx.closed() => return,
-                    _ = ka.tick(), if first => {
-                        if tx.send(Ok(Bytes::from_static(b": keepalive\n\n"))).await.is_err() { return; }
-                    }
+                    );
+                    let _ = send_frame(&tx, sse_error(&e), idle).await;
+                    return;
                 }
             };
             match next {
-                Err(_) => {
-                    log.outcome = "idle_timeout";
-                    let _ = tx
-                        .send(Ok(sse_error(&ApiError::new(
-                            504,
-                            "server_error",
-                            "stream_stalled",
-                            "The model stopped producing output.",
-                        ))))
-                        .await;
-                    return;
-                }
-                Ok(None) => {
-                    log.outcome = "ok";
-                    break;
-                }
-                Ok(Some(Err(_))) => {
+                None => break,
+                Some(Err(_)) => {
                     log.outcome = "engine_error";
-                    let _ = tx
-                        .send(Ok(sse_error(&ApiError::new(
-                            502,
-                            "server_error",
-                            "engine_error",
-                            "The model stream failed.",
-                        ))))
-                        .await;
+                    let e = ApiError::new(
+                        502,
+                        "server_error",
+                        "engine_error",
+                        "The model stream failed.",
+                    );
+                    let _ = send_frame(&tx, sse_error(&e), idle).await;
                     return;
                 }
-                Ok(Some(Ok(chunk))) => {
+                Some(Ok(chunk)) => {
                     if first {
                         log.first_byte_ms = Some(log.started.elapsed().as_millis() as i64);
                         first = false;
                     }
+                    stall.as_mut().reset(tokio::time::Instant::now() + idle);
                     tail.extend_from_slice(&chunk);
                     if tail.len() > 4096 {
                         let cut = tail.len() - 4096;
                         tail.drain(..cut);
                     }
-                    if tx.send(Ok(chunk)).await.is_err() {
+                    if let Err(o) = send_frame(&tx, chunk, idle).await {
+                        log.outcome = o;
                         return;
                     }
                 }
             }
         }
+        let tail = String::from_utf8_lossy(&tail);
         // Verified usage only if the upstream sent a usage event (stream_options.include_usage).
-        if let Some(line) = String::from_utf8_lossy(&tail)
+        if let Some(line) = tail
             .lines()
             .rev()
             .find(|l| l.starts_with("data: {") && l.contains("\"usage\""))
@@ -1010,6 +1093,23 @@ fn stream_response(
             if let Ok(v) = serde_json::from_str::<Value>(&line[6..]) {
                 log.usage(&v);
             }
+        }
+        if ends_with_done(&tail) {
+            log.outcome = "ok";
+        } else {
+            // The upstream closed without [DONE]: the engine died mid-answer (its SSE body is
+            // close-delimited, so that reads as a clean end). Report it rather than pass a cut
+            // answer off as complete; blank lines first terminate any half-sent event.
+            log.outcome = "truncated";
+            let whole = tail.is_empty() || tail.ends_with("\n\n") || tail.ends_with("\r\n\r\n");
+            let sep: &[u8] = if whole { b"" } else { b"\n\n" };
+            let e = ApiError::new(
+                502,
+                "server_error",
+                "engine_error",
+                "The model stream ended unexpectedly.",
+            );
+            let _ = send_frame(&tx, [sep, &sse_error(&e)].concat().into(), idle).await;
         }
     });
     let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async {

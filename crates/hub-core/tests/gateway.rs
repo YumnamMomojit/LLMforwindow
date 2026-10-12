@@ -57,26 +57,68 @@ async fn mock_chat(State(m): State<Arc<Mock>>, h: HeaderMap, Json(b): Json<Value
         return Response::builder().status(400).header("content-type", "application/json")
             .body(Body::from(r#"{"error":{"message":"prompt too long /secret/path","code":"context_length_exceeded"}}"#)).unwrap();
     }
+    if marker.starts_with("stuckerr") {
+        // error status whose body never completes
+        let s = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        return Response::builder()
+            .status(500)
+            .body(Body::from_stream(s))
+            .unwrap();
+    }
     if b["stream"] == true {
         let guard = DropGuard(m.clone());
+        if marker.starts_with("wedge") {
+            // 200 headers, then not a single body byte
+            let s = futures_util::stream::unfold(guard, |g| async move {
+                std::future::pending::<()>().await;
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::new()), g))
+            });
+            return Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(s))
+                .unwrap();
+        }
+        if marker.starts_with("flood") {
+            // endless large chunks, enough to fill every buffer towards a client that stops reading
+            let chunk = axum::body::Bytes::from(vec![b'x'; 128 << 10]);
+            let s =
+                futures_util::stream::repeat_with(move || Ok::<_, std::io::Error>(chunk.clone()));
+            return Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(s))
+                .unwrap();
+        }
         let delay_first = if marker.starts_with("late") { 2500 } else { 0 };
         let slow =
             marker.starts_with("slow") || marker.starts_with("late") || marker.starts_with("q");
+        let step = match () {
+            _ if marker.starts_with("hold") => 700,
+            _ if marker.starts_with("drip") => 300,
+            _ if slow => 250,
+            _ => 0,
+        };
+        // "trunc" ends cleanly after two events without ever sending [DONE]
+        let truncated = marker.starts_with("trunc");
+        let count = match () {
+            _ if truncated => 2,
+            _ if marker.starts_with("drip") => 1000,
+            _ => 5,
+        };
         let s = futures_util::stream::unfold((0u32, guard, marker), move |(i, g, mk)| async move {
             if i == 0 && delay_first > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_first)).await;
             }
-            if i >= 5 {
+            if i >= count {
                 return None;
             }
-            if slow {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            if step > 0 {
+                tokio::time::sleep(Duration::from_millis(step)).await;
             }
             let chunk = format!(
                 "data: {}\n\n",
                 json!({"choices":[{"delta":{"content":format!("{mk}#{i} ")}}]})
             );
-            let out = if i == 4 {
+            let out = if i + 1 == count && !truncated {
                 format!("{chunk}data: [DONE]\n\n")
             } else {
                 chunk
@@ -93,6 +135,12 @@ async fn mock_chat(State(m): State<Arc<Mock>>, h: HeaderMap, Json(b): Json<Value
     }
     if marker.starts_with("slow") {
         tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    if marker.starts_with("badjson") {
+        return Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
     }
     Response::builder()
         .header("content-type", "application/json")
@@ -168,6 +216,37 @@ async fn post_chat(e: &Env, body: &Value) -> reqwest::Response {
         .send()
         .await
         .unwrap()
+}
+
+/// Polls `f` for up to `secs` seconds.
+async fn eventually(mut f: impl FnMut() -> bool, secs: u64) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(secs) {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    f()
+}
+
+/// (status, outcome) of the newest request_log row for streaming or non-streaming requests.
+fn last_log(e: &Env, stream: bool) -> Option<(i64, String)> {
+    e.db.query_row(
+        "SELECT status,outcome FROM request_log WHERE stream=?1 ORDER BY id DESC LIMIT 1",
+        [stream as i64],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
+}
+
+/// Raw HTTP/1.1 request head for the chat endpoint (for clients reqwest cannot imitate).
+fn raw_head(e: &Env, content_length: usize) -> String {
+    format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {}\r\n\
+         content-type: application/json\r\ncontent-length: {content_length}\r\n\r\n",
+        e.token
+    )
 }
 
 #[tokio::test]
@@ -298,6 +377,8 @@ async fn request_sanitising() {
         json!({"n":2}),
         json!({"temperature":9}),
         json!({"stop":["a","b","c","d","e"]}),
+        json!({"stop":""}),
+        json!({"stop":"x".repeat(65)}),
     ] {
         let mut b = chat("hi", false);
         b.as_object_mut()
@@ -314,10 +395,12 @@ async fn request_sanitising() {
     assert_eq!(post_chat(&e, &tool).await.status(), 400);
     // clamp + ignored fields dropped + text parts flattened
     let ok = json!({"model":"test-model","max_tokens":99999,"seed":5,"user":"u","temperature":0.5,
+        "stop":"END",
         "messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]});
     assert_eq!(post_chat(&e, &ok).await.status(), 200);
     let seen = e.mock.last_body.lock().unwrap().clone().unwrap();
     assert_eq!(seen["max_tokens"], 100);
+    assert_eq!(seen["stop"], json!(["END"]));
     assert!(seen.get("seed").is_none() && seen.get("user").is_none());
     assert_eq!(seen["messages"][0]["content"], "ab");
     // body limit and content type
@@ -480,6 +563,165 @@ async fn keepalive_comments_precede_slow_first_token() {
     let mut s = r.bytes_stream();
     let first = String::from_utf8_lossy(&s.next().await.unwrap().unwrap()).to_string();
     assert!(first.starts_with(": keepalive"), "{first}");
+}
+
+#[tokio::test]
+async fn client_giving_up_in_the_queue_frees_its_place() {
+    let e = setup(|c| {
+        c.max_active = 1;
+        c.max_queue = 1;
+    })
+    .await;
+    let holder = post_chat(&e, &chat("hold", true)).await;
+    assert!(eventually(|| e.gw.snapshot().active == 1, 2).await);
+    let url = format!("{}/v1/chat/completions", e.base);
+    // Two clients queue behind the holder and give up; with max_queue=1 the second one
+    // would be rejected outright if the first had leaked its place.
+    for _ in 0..2 {
+        let r = client()
+            .post(&url)
+            .bearer_auth(&e.token)
+            .json(&chat("hi", false))
+            .timeout(Duration::from_millis(300))
+            .send()
+            .await;
+        assert!(
+            r.as_ref().is_err_and(|err| err.is_timeout()),
+            "expected to wait in the queue and give up: {r:?}"
+        );
+        assert!(
+            eventually(|| e.gw.snapshot().queued == 0, 2).await,
+            "abandoned waiter still counted: {:?}",
+            e.gw.snapshot()
+        );
+    }
+    // the slot is still busy, so a patient request queues (no 429) and runs after the holder
+    assert_eq!(e.gw.snapshot().active, 1);
+    assert_eq!(post_chat(&e, &chat("after", false)).await.status(), 200);
+    assert!(holder.text().await.unwrap().contains("hold#4"));
+    assert_eq!(e.gw.snapshot().queued, 0);
+}
+
+#[tokio::test]
+async fn truncated_upstream_stream_is_reported_not_passed_off_as_complete() {
+    let e = setup(|_| {}).await;
+    let text = post_chat(&e, &chat("trunc", true))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("trunc#1"), "{text}");
+    assert!(text.contains("\"engine_error\""), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert!(
+        eventually(|| last_log(&e, true).is_some(), 2).await,
+        "no log row"
+    );
+    assert_eq!(last_log(&e, true).unwrap(), (200, "truncated".into()));
+    // a complete stream is still "ok"
+    let text = post_chat(&e, &chat("full", true))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(!text.contains("error"), "{text}");
+    assert!(eventually(|| last_log(&e, true).unwrap().1 == "ok", 2).await);
+    // non-streaming: a 2xx with an unparseable body is an engine error, and logged as one
+    let r = post_chat(&e, &chat("badjson", false)).await;
+    assert_eq!(r.status(), 502);
+    assert!(eventually(|| last_log(&e, false).is_some(), 2).await);
+    assert_eq!(last_log(&e, false).unwrap(), (502, "engine_error".into()));
+}
+
+#[tokio::test]
+async fn first_byte_deadline_is_not_reset_by_keepalives() {
+    let e = setup(|c| {
+        c.keepalive_secs = 1;
+        c.first_byte_timeout_secs = 2;
+        c.stream_idle_timeout_secs = 1;
+    })
+    .await;
+    let t0 = Instant::now();
+    let r = post_chat(&e, &chat("wedge", true)).await;
+    let text = tokio::time::timeout(Duration::from_secs(10), r.text())
+        .await
+        .expect("stream never ended: keepalives kept restarting the first-byte timeout")
+        .unwrap();
+    assert!(text.starts_with(": keepalive"), "{text}");
+    assert!(text.contains("deadline_exceeded"), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert!(eventually(|| e.gw.snapshot().active == 0, 2).await);
+    // an error status whose body never completes is bounded too
+    let r = post_chat(&e, &chat("stuckerr", true)).await;
+    let text = tokio::time::timeout(Duration::from_secs(10), r.text())
+        .await
+        .expect("error body read never ended")
+        .unwrap();
+    assert!(text.contains("engine_error"), "{text}");
+}
+
+#[tokio::test]
+async fn stream_deadline_applies_while_output_continues() {
+    let e = setup(|c| c.request_deadline_secs = 1).await;
+    let t0 = Instant::now();
+    let r = post_chat(&e, &chat("drip", true)).await;
+    let text = tokio::time::timeout(Duration::from_secs(10), r.text())
+        .await
+        .expect("deadline never fired")
+        .unwrap();
+    assert!(text.contains("drip#0"), "{text}");
+    assert!(text.contains("deadline_exceeded"), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+}
+
+#[tokio::test]
+async fn client_that_stops_reading_releases_the_slot() {
+    use tokio::io::AsyncWriteExt;
+    let e = setup(|c| c.stream_idle_timeout_secs = 1).await;
+    let body = chat("flood", true).to_string();
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut s = sock.connect(e.gw.addr).await.unwrap();
+    s.write_all(format!("{}{body}", raw_head(&e, body.len())).as_bytes())
+        .await
+        .unwrap();
+    // `s` stays open and is never read
+    assert!(eventually(|| e.gw.snapshot().active == 1, 2).await);
+    assert!(
+        eventually(|| e.gw.snapshot().active == 0, 8).await,
+        "a client that stopped reading kept the generation slot"
+    );
+    assert_eq!(post_chat(&e, &chat("hi", false)).await.status(), 200);
+    assert!(eventually(|| last_log(&e, true).is_some(), 2).await);
+    assert_eq!(last_log(&e, true).unwrap(), (200, "client_stalled".into()));
+    drop(s);
+}
+
+#[tokio::test]
+async fn trickled_request_body_times_out() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let e = setup(|c| c.body_read_timeout_secs = 1).await;
+    let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    // headers promise 100 body bytes, only a few ever arrive
+    s.write_all(format!("{}{{\"model\"", raw_head(&e, 100)).as_bytes())
+        .await
+        .unwrap();
+    let t0 = Instant::now();
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("no response while the body trickles")
+            .unwrap();
+        assert!(n > 0, "connection closed without a response");
+        head.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
 }
 
 #[tokio::test]
