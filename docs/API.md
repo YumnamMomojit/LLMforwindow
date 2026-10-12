@@ -21,7 +21,7 @@ Errors: `{"error":{"message","type","code"}}`. 400 validation/`context_length_ex
 403 `host_not_allowed`/`insufficient_scope`, 404 unknown model/route, 408 `request_timeout` (body not received within 30 s), 413 `request_too_large` (1 MiB), 415, 429 `rate_limit_exceeded`
 (per key, 30/min default) / `queue_full` (+`Retry-After`), 503 `engine_unavailable`/`queue_timeout`/`engine_busy`, 504 deadline/`stream_stalled`.
 Mid-stream failures are reported as a final `data: {"error":...}` event followed by `[DONE]`. This includes an upstream stream that ends without `[DONE]` (`engine_error`, "The model stream ended unexpectedly."); clients must treat a stream as complete only after `[DONE]` with no preceding error event.
-Request-log outcomes: `ok`, `rejected`, `cancelled` (client left), `deadline`, `idle_timeout`, `engine_error`, `upstream_error`, `truncated` (upstream ended without `[DONE]`), `client_stalled` (client stopped reading for the idle timeout; the slot is released).
+Request-log outcomes: `ok`, `rejected`, `cancelled` (client left), `deadline`, `idle_timeout`, `engine_error`, `upstream_error`, `truncated` (upstream ended without `[DONE]`), `client_stalled` (client stopped reading for the idle timeout; the slot is released and the response is aborted: the connection closes without the chunked terminator, so the client sees a failed transfer rather than a clean end).
 Defaults: 1 active generation, 4 queued, queue wait 30 s, first-byte wait 600 s, stream idle 120 s, total 900 s.
 While waiting for the first token, streams emit `: keepalive` SSE comments every 15 s — clients must ignore comment lines.
 

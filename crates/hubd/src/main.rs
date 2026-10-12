@@ -654,10 +654,9 @@ async fn serve(dir: &Path, db_path: &Path, o: ServeOpts) -> Result<()> {
     // Records added before verbatim paths were stripped still work.
     let model_dir = engine_path(rec.path)?;
     let t = hub_core_now();
-    if keys::list(&c)?
-        .iter()
-        .all(|k| k.revoked_at.is_some_and(|r| r <= t) || k.expires_at.is_some_and(|e| e <= t))
-    {
+    if keys::list(&c)?.iter().all(|k| {
+        k.revoked || k.revoked_at.is_some_and(|r| r <= t) || k.expires_at.is_some_and(|e| e <= t)
+    }) {
         say_err!("note: no active API keys; create one with `hubd key create <name>`");
     }
     let store = FileSecrets::new(&dir.join("secrets"))?;

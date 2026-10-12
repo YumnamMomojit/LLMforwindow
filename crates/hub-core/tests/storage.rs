@@ -553,9 +553,9 @@ fn migrations_idempotent_and_future_schema_refused() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("m.db");
     let c = db::open(&p).unwrap();
-    assert_eq!(db::schema_version(&c), 2);
+    assert_eq!(db::schema_version(&c), 3);
     drop(c);
-    assert_eq!(db::schema_version(&db::open(&p).unwrap()), 2);
+    assert_eq!(db::schema_version(&db::open(&p).unwrap()), 3);
     rusqlite::Connection::open(&p)
         .unwrap()
         .pragma_update(None, "user_version", 99)

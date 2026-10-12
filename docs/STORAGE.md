@@ -10,7 +10,7 @@
   exports\  cache\  logs\         reserved areas (created by `hubd init`)
 <models root, user-chosen>        model weights are referenced in place, never copied or deleted
 ```
-SQLite: WAL, `PRAGMA user_version` migrations (v2 now); a newer DB than the app refuses to open. Binary files are on disk, never blobs.
+SQLite: WAL, `PRAGMA user_version` migrations (v3 now; v3 adds an explicit `revoked` flag so revocation does not depend on the clock); a newer DB than the app refuses to open. Binary files are on disk, never blobs.
 Quota per workspace and a free-space reserve are enforced during streaming writes. Export = zip (`metadata.json` + `files/...`, no models, no secrets).
 Database backup = `VACUUM INTO` snapshot with `api_keys`/`request_log` removed. No automatic/cloud/encrypted backup and no secure erase (SSD) in v1.
 Removing a model from the catalog never deletes user files. Destructive workspace operations require an explicit `confirmed=true`

@@ -9,7 +9,10 @@
 | upstream | http://127.0.0.1:18080 | must be http + loopback (set automatically by `serve`) |
 | model_id | — | only id served/accepted |
 | max_body_bytes / max_messages | 1 MiB / 256 | |
-| body_read_timeout_secs | 30 | a request body not fully received in time gets 408 `request_timeout` (no header-read timeout yet: axum::serve exposes none) |
+| header_read_timeout_secs | 30 | a request head not fully received in time (counted from connect, or from the end of the previous response on a keep-alive connection) closes the connection without a response; bounds silent, trickling and idle connections |
+| body_read_timeout_secs | 30 | a request body not fully received in time gets 408 `request_timeout` |
+| max_connections | 256 | client connections open at once; further connections are closed as soon as they are accepted |
+| write_stall_timeout_secs | 180 | a response write blocked this long (client not reading) closes the connection; keep it above stream_idle_timeout_secs |
 | max_active / max_queue | 1 / 4 | simultaneous generations / waiters |
 | queue_timeout_secs / request_deadline_secs | 30 / 900 | |
 | first_byte_timeout_secs / stream_idle_timeout_secs / keepalive_secs | 600 / 120 / 15 | |
