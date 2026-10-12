@@ -19,6 +19,10 @@ Status legend: **Impl** = merged and used as-is; **Reuse** = usable with a wrapp
   client disconnect (CANCEL sent to engine), SSE, usage counts, refuses non-loopback bind without a key. It is **one
   shared key, no scopes, no per-key limits, and ~dozens of routes** (UI, systemone, completions, Anthropic-style, ...), and
   CORS defaults/`*` are configurable. It must not be exposed directly → the Hub's restricted gateway.
+* Layout: the release archives (release.yml "Package" step + `c/tools/pack_python.py`) put `openai_server.py`, its import
+  closure (incl. `family_registry.py`) and the engines **flat at the archive root**; a source checkout keeps them in `c/`. The Hub
+  accepts both (`engine::server_script`, `scripts/validate_model.py`); the first build only accepted `c/` and failed on the
+  release layout with `ModuleNotFoundError: family_registry` (found while packaging, fixed, tested with a pack_python.py-built folder).
 * The server serialises generation by default (`--kv-slots 1`; 2.0.0 adds up to 16 slots). The Hub keeps 1 active generation.
 
 ## Capability matrix

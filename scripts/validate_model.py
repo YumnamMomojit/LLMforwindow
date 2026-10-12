@@ -14,7 +14,10 @@ def main():
     if len(sys.argv) != 3:
         print(json.dumps({"ok": False, "error": "usage: validate_model.py <colibri_checkout> <model_dir>"}))
         return 2
-    sys.path.insert(0, str(Path(sys.argv[1]) / "c"))
+    # Source checkout keeps the Python in c/; a release archive packs it flat at its root.
+    root = Path(sys.argv[1])
+    code = root / "c" if (root / "c" / "family_registry.py").is_file() else root
+    sys.path.insert(0, str(code))
     try:
         import family_registry as fr
         r = fr.resolve_model(sys.argv[2])

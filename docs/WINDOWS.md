@@ -15,8 +15,8 @@ cargo test --workspace
 cargo build --release -p hubd
 ```
 ## End-user runtime (what an installer must carry — not yet packaged)
-`hubd.exe`; Python 3.10+ (embeddable distribution or system); the upstream **Windows release archive** for v2.0.0 (engines `.exe`, `shaders\`, `c\openai_server.py`
-and friends, with `LICENSE`/`NOTICE`/`THIRD_PARTY_NOTICES.md`) — **verify its SHA-256 yourself against a value you trust before bundling**; model weights are separate.
+`hubd.exe`; Python 3.10+ (embeddable distribution or system); the upstream **Windows release archive** for v2.0.0 (engines `.exe`, `shaders\`, and `openai_server.py`
+with the Python it imports, all flat at the archive root, with `LICENSE`/`NOTICE`/`THIRD_PARTY_NOTICES.md`) — **verify its SHA-256 yourself against a value you trust before bundling**; model weights are separate.
 WebView2 is needed only for the future Tauri shell. `packaging/build-portable.ps1` assembles a portable folder from those pieces (UNTESTED):
 it always rebuilds `hubd.exe`, refuses to package after a failed build, empties its own output folder first, and writes `hub.cmd`, which runs
 `hubd.exe` with the bundled Python and Colibri. Unverified: the embeddable Python's `python3XX._pth` may stop `openai_server.py` from

@@ -43,8 +43,9 @@ fail() {
   exit 1
 }
 
+# start_hubd [COLIBRI]: defaults to the source checkout; the release-layout run passes a flat folder.
 start_hubd() {
-  "$H" serve --model fixture --colibri-dir "$COLIBRI_DIR" --port "$PORT" >"$WORK/hubd.log" 2>&1 &
+  "$H" serve --model fixture --colibri-dir "${1:-$COLIBRI_DIR}" --port "$PORT" >"$WORK/hubd.log" 2>&1 &
   HUBD_PID=$!
   for _ in $(seq 120); do
     grep -q "^local API ready" "$WORK/hubd.log" && return 0
@@ -112,4 +113,18 @@ shutdown_check INT
 
 start_hubd
 shutdown_check TERM
-echo "PASS: all clients, SIGINT and SIGTERM shutdown"
+
+# The official release archive is flat (openai_server.py, its imports and the engines at the
+# root, no c/): build the same layout with upstream's own packer and serve from it.
+echo "== release-archive layout"
+mkdir -p "$WORK/release"
+"$PY" -I "$COLIBRI_DIR/c/tools/pack_python.py" "$COLIBRI_DIR/c" "$WORK/release" >/dev/null
+cp "$COLIBRI_DIR/c/mimo" "$WORK/release/"
+[ ! -d "$WORK/release/c" ] || fail "packed release unexpectedly has a c/ folder"
+"$H" model validate "$WORK/model" --colibri-dir "$WORK/release" >"$WORK/release_validate.out" 2>&1 \
+  || { cat "$WORK/release_validate.out"; fail "model validate failed on the release layout"; }
+start_hubd "$WORK/release"
+client release_curl sh "$HERE/examples/curl.sh"
+expect release_curl '"id": ?"fixture"' '^data: \[DONE\]'
+shutdown_check INT
+echo "PASS: all clients, SIGINT and SIGTERM shutdown, release-archive layout"

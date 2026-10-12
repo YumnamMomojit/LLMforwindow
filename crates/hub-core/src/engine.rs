@@ -48,7 +48,8 @@ pub trait InferenceAdapter {
 #[derive(Debug, Clone)]
 pub struct ColibriConfig {
     pub python: PathBuf,
-    /// Checkout / unpacked release containing `c/openai_server.py` (pinned in docs/UPSTREAM.md).
+    /// Source checkout (`c/openai_server.py`) or unpacked release archive (`openai_server.py`
+    /// at its root, next to the engines); pinned in docs/UPSTREAM.md. See `server_script`.
     pub colibri_dir: PathBuf,
     /// Optional explicit engine executable; otherwise the upstream launcher picks one.
     pub engine_exe: Option<PathBuf>,
@@ -112,6 +113,18 @@ fn actionable(tail: &str) -> Option<&'static str> {
 /// Absolute without touching the file system or adding a `\\?\` prefix (unlike canonicalize).
 fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Where upstream's server script lives: `c/openai_server.py` in a source checkout, or
+/// `openai_server.py` at the root of a release archive (release.yml packs the Python flat,
+/// next to the engines, which `default_engine()` then finds beside the script).
+pub fn server_script(colibri_dir: &Path) -> Option<PathBuf> {
+    [
+        colibri_dir.join("c").join("openai_server.py"),
+        colibri_dir.join("openai_server.py"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 /// Paths for one start, all absolute: the child runs with `current_dir = colibri_dir`, so a
@@ -209,7 +222,8 @@ impl InferenceAdapter for ColibriAdapter {
         let colibri_dir = absolute(&self.cfg.colibri_dir);
         let p = LaunchPaths {
             python: absolute(&self.cfg.python),
-            script: colibri_dir.join("c").join("openai_server.py"),
+            script: server_script(&colibri_dir)
+                .unwrap_or_else(|| colibri_dir.join("c").join("openai_server.py")),
             model_dir: absolute(&self.cfg.model_dir),
             engine_exe: self.cfg.engine_exe.as_deref().map(absolute),
             colibri_dir,
@@ -219,8 +233,9 @@ impl InferenceAdapter for ColibriAdapter {
         }
         if !p.script.is_file() {
             return Err(self.fail(format!(
-                "Colibri server script not found: {}",
-                p.script.display()
+                "Colibri not found in {}: expected openai_server.py at its root (an unpacked \
+                 release archive) or in c\\ (a source checkout)",
+                p.colibri_dir.display()
             )));
         }
         if !p.model_dir.join("config.json").is_file() {

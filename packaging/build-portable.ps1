@@ -33,12 +33,15 @@ Copy-Item (Join-Path $Root 'target\release\hubd.exe') $Out
 Copy-Item -Recurse (Join-Path $Root 'scripts') (Join-Path $Out 'scripts')
 Copy-Item -Recurse $Python (Join-Path $Out 'python')
 Expand-Archive $ColibriRelease (Join-Path $Out 'colibri')
-# The archive may or may not wrap everything in one top-level folder.
+# The official release packs openai_server.py flat at the archive root (a source tree keeps it
+# in c\); the archive may or may not wrap everything in one top-level folder.
+function Test-Colibri($dir) {
+    (Test-Path (Join-Path $dir 'openai_server.py')) -or (Test-Path (Join-Path $dir 'c\openai_server.py'))
+}
 $colibri = 'colibri'
-if (-not (Test-Path (Join-Path $Out 'colibri\c\openai_server.py'))) {
-    $inner = @(Get-ChildItem -Directory (Join-Path $Out 'colibri') |
-        Where-Object { Test-Path (Join-Path $_.FullName 'c\openai_server.py') })
-    if ($inner.Count -ne 1) { throw "c\openai_server.py not found in $ColibriRelease" }
+if (-not (Test-Colibri (Join-Path $Out 'colibri'))) {
+    $inner = @(Get-ChildItem -Directory (Join-Path $Out 'colibri') | Where-Object { Test-Colibri $_.FullName })
+    if ($inner.Count -ne 1) { throw "openai_server.py not found in $ColibriRelease" }
     $colibri = "colibri\$($inner[0].Name)"
 }
 Copy-Item (Join-Path $Root 'LICENSE'), (Join-Path $Root 'NOTICE'), (Join-Path $Root 'docs\UPSTREAM.md') $Out
