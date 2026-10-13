@@ -39,22 +39,26 @@ fn the_untested_portable_script_is_gone_and_nothing_points_at_it() {
 }
 
 #[test]
-fn hub_cmd_keeps_bangs_and_skips_an_embeddable_python() {
+fn hub_cmd_is_a_thin_launcher_that_keeps_bangs() {
     let cmd = read("packaging/hub.cmd");
     assert!(
         cmd.contains("setlocal EnableExtensions DisableDelayedExpansion\r\n"),
         "delayed expansion would eat every ! (and cmd wants CRLF)"
     );
-    // A python folder with a ._pth file beside python.exe (the embeddable package) is not used.
-    let skip = cmd
-        .find("for %%F in (*._pth) do set \"HUB_SKIPPED_PTH=%%F\"")
-        .expect("._pth check");
-    let pick = cmd
-        .find("if not defined HUB_SKIPPED_PTH set \"HUB_PYTHON=%HUB_HOME%python\\python.exe\"")
-        .expect("python folder pick");
-    assert!(skip < pick);
-    // check runs the Python it found and fails for one that drops the script's own folder.
-    assert!(cmd.contains("sys.exit(sys.path[:1] != [''])"));
+    assert!(
+        cmd.contains("\"%~dp0hubd.exe\" %*\r\n"),
+        "arguments are passed through"
+    );
+    // Python discovery moved into hubd: cmd's `for /f` decodes program output with the console
+    // code page and garbled a Python under C:\Users\José (release gate). No `for /f` may return.
+    assert!(
+        !cmd.to_ascii_lowercase().contains("for /f"),
+        "hub.cmd must not parse program output"
+    );
+    assert!(
+        !cmd.contains("HUB_PYTHON="),
+        "hubd finds Python, not hub.cmd"
+    );
 }
 
 #[test]

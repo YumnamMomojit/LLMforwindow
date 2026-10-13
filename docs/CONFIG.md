@@ -14,13 +14,12 @@
 | max_connections | 256 | client connections open at once; when all are open, a new connection takes the place of the oldest one that has not sent its request head yet, and only when every place is serving a request is the new one closed on accept |
 | write_stall_timeout_secs | 180 | a response write blocked this long (client not reading) closes the connection; keep it above stream_idle_timeout_secs |
 | max_active / max_queue | 1 / 4 | simultaneous generations / waiters |
-| queue_timeout_secs / request_deadline_secs | 30 / 900 | |
-| first_byte_timeout_secs / stream_idle_timeout_secs / keepalive_secs | 600 / 120 / 15 | |
+| queue_timeout_secs / request_deadline_secs | 30 / 3600 | request_deadline bounds a whole reply, streaming or not (`serve --request-deadline`) |
+| first_byte_timeout_secs / stream_idle_timeout_secs / keepalive_secs | 600 / 120 / 15 | streaming only; a non-streaming answer arrives when generation is done and only the request deadline bounds it |
 | max_output_tokens / default_output_tokens | 4096 / 1024 | cap on a request's `max_tokens`/`max_completion_tokens` / used when a request sets neither (never above the cap). `serve --max-output-tokens N` (1..32768) sets the cap and the engine's `--max-tokens` |
 | rate_limit_per_min | 30 | per key; 0 = off |
 | allowed_hosts | [] | Host allowlist; empty = any |
 
 `hubd serve` flags: `--port` (8787), `--max-active` (1..16, default 1), `--startup-timeout` (seconds to wait for the engine to become ready,
-1..86400, default 900), `--max-output-tokens` (1..32768, default 4096), `--share` group. Data dir: `--data-dir` / `HUB_DATA_DIR`. Engine runtime: `--python` / `HUB_PYTHON` (else `python3`,
-`python.exe` on Windows, from PATH) and `--colibri-dir` / `HUB_COLIBRI_DIR`; a flag wins over the variable. Unknown flags, extra arguments
+1..86400, default 900), `--max-output-tokens` (1..32768, default 4096), `--request-deadline` (60..86400 s, default 3600), `--share` group. Data dir: `--data-dir` / `HUB_DATA_DIR`. Engine runtime: `--python` / `HUB_PYTHON` (else the first Python 3.10+ that can run the engine: on Windows a `python` folder next to hubd.exe, the `py` launcher, then `python`; elsewhere `python3`, `python`) and `--colibri-dir` / `HUB_COLIBRI_DIR` (else a `colibri` folder next to hubd, flat, `c\` or one folder deeper); a flag wins over the variable. Unknown flags, extra arguments
 and flags without a value are errors. Settings in DB: `history.enabled`, `history.retention_days`.

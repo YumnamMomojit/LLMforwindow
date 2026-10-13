@@ -119,11 +119,40 @@ fn workspace_get_through_a_symlink_to_a_device_keeps_the_link() {
         "--overwrite",
     ]);
     assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
-    // A regular file is still written, synced and reported on stdout.
+    // A regular file is still written and synced; the summary goes to stderr.
     let dest = s.0.join("copy.txt");
     let o = s.ok(&["workspace", "get", "A", "notes.txt", dest.to_str().unwrap()]);
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello notes");
-    assert!(String::from_utf8_lossy(&o.stdout).contains("wrote"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("wrote"));
+    assert!(o.stdout.is_empty());
+}
+
+/// `get ... /dev/stdout > out.txt`: /dev/stdout opens as a regular file with its own offset, so
+/// a summary printed on stdout would overwrite the start of the copy.
+#[test]
+fn workspace_get_to_redirected_stdout_is_an_exact_copy() {
+    let s = Scratch::with_notes("get-stdout-file");
+    let out = s.0.join("out.txt");
+    let o = Command::new(env!("CARGO_BIN_EXE_hubd"))
+        .arg("--data-dir")
+        .arg(s.data())
+        .args([
+            "workspace",
+            "get",
+            "A",
+            "notes.txt",
+            "/dev/stdout",
+            "--overwrite",
+        ])
+        .env("RUST_BACKTRACE", "0")
+        .env_remove("HUB_DATA_DIR")
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&out).unwrap())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello notes");
 }
 
 fn python_available() -> bool {

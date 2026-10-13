@@ -429,7 +429,7 @@ fn a_limit_the_server_lowered_is_named() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.contains(CUT), "{out}");
     assert!(
-        out.contains("[the server limits replies to 1024 tokens, fewer than the 8000 asked for; `hubd serve --max-output-tokens N` raises that limit]"),
+        out.contains("[the reply stopped after 1024 of the 8000 tokens asked for: either the server's limit (`hubd serve --max-output-tokens N`) or the model's context window, which a long conversation fills (/new starts fresh)]"),
         "{out}"
     );
     assert_eq!(api.bodies.lock().unwrap()[0]["max_tokens"], 8000);

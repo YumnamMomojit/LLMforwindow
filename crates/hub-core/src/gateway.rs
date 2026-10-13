@@ -58,11 +58,14 @@ pub struct GatewayConfig {
     /// Requests allowed to wait for a free slot.
     pub max_queue: usize,
     pub queue_timeout_secs: u64,
-    /// Whole-request deadline (non-streaming) / total stream duration.
+    /// Whole-request deadline (non-streaming) / total stream duration. Generous: a CPU engine
+    /// at ~1 token/s needs ~17 minutes for the default 1024-token reply.
     pub request_deadline_secs: u64,
     /// Max silence between upstream stream bytes once generation started.
     pub stream_idle_timeout_secs: u64,
-    /// Max wait for the upstream to answer (covers long prompt prefill).
+    /// Streaming only: max wait for the first upstream byte (covers long prompt prefill).
+    /// A non-streaming answer arrives only when generation is done, so only
+    /// `request_deadline_secs` bounds it.
     pub first_byte_timeout_secs: u64,
     /// SSE comment cadence while waiting for first byte (proxies with ~100 s limits).
     pub keepalive_secs: u64,
@@ -93,7 +96,7 @@ impl Default for GatewayConfig {
             max_active: 1,
             max_queue: 4,
             queue_timeout_secs: 30,
-            request_deadline_secs: 900,
+            request_deadline_secs: 3600,
             stream_idle_timeout_secs: 120,
             first_byte_timeout_secs: 600,
             keepalive_secs: 15,
@@ -1077,7 +1080,6 @@ async fn chat(inner: Arc<Inner>, req: Request) -> Result<Response, ApiError> {
                 .bearer_auth(&inner.internal_key)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload)
-                .timeout(Duration::from_secs(inner.cfg.first_byte_timeout_secs))
                 .send()
                 .await?;
             let st = r.status().as_u16();

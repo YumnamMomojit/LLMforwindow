@@ -182,12 +182,9 @@ pub fn workspace(dir: &Path, mut args: Args) -> Result<()> {
                         .with_context(|| format!("writing {} failed{what}", dest.display()));
                 }
             };
-            if regular {
-                println!("wrote {} ({})", dest.display(), mb(n));
-            } else {
-                // stdout may be the destination itself.
-                eprintln!("wrote {} ({})", dest.display(), mb(n));
-            }
+            // Always on stderr: the destination can be stdout itself even when it is a regular
+            // file (`get ws f /dev/stdout > out.txt`), and a line on stdout would land in the copy.
+            eprintln!("wrote {} ({})", dest.display(), mb(n));
         }
         "rm" => {
             let yes = args.switch("--yes");
@@ -515,6 +512,10 @@ impl NoEcho {
                     restore_echo_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 new.sa_flags = libc::SA_RESETHAND;
                 libc::sigemptyset(&mut new.sa_mask);
+                // tcsetattr from a background job would raise SIGTTOU and stop the process
+                // inside the handler; with SIGTTOU blocked it is allowed (POSIX) and the
+                // re-raised signal then ends the process as it should.
+                libc::sigaddset(&mut new.sa_mask, libc::SIGTTOU);
                 if libc::sigaction(sig, &new, std::ptr::null_mut()) == 0 {
                     handlers.push((sig, old));
                 }
@@ -790,9 +791,12 @@ fn length_notes(asked: Option<i64>, completion_tokens: Option<i64>) -> Vec<Strin
     ];
     if let (Some(asked), Some(got)) = (asked, completion_tokens) {
         if (1..asked).contains(&got) {
+            // The client cannot tell which limit it was: the server's cap, or the engine's
+            // context window (the engine shrinks the budget to the room the prompt leaves).
             notes.push(format!(
-                "[the server limits replies to {got} tokens, fewer than the {asked} asked for; \
-                 `hubd serve --max-output-tokens N` raises that limit]"
+                "[the reply stopped after {got} of the {asked} tokens asked for: either the \
+                 server's limit (`hubd serve --max-output-tokens N`) or the model's context \
+                 window, which a long conversation fills (/new starts fresh)]"
             ));
         }
     }
@@ -1305,8 +1309,9 @@ mod tests {
         let lowered = length_notes(Some(8000), Some(4096));
         assert_eq!(lowered[0], plain);
         assert!(
-            lowered[1].contains("limits replies to 4096 tokens, fewer than the 8000 asked for")
-                && lowered[1].contains("--max-output-tokens"),
+            lowered[1].contains("stopped after 4096 of the 8000 tokens asked for")
+                && lowered[1].contains("--max-output-tokens")
+                && lowered[1].contains("context window"),
             "{lowered:?}"
         );
     }

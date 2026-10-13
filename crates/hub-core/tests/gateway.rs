@@ -136,6 +136,10 @@ async fn mock_chat(State(m): State<Arc<Mock>>, h: HeaderMap, Json(b): Json<Value
     if marker.starts_with("slow") {
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
+    // A whole non-streaming generation: nothing is sent until it is done.
+    if marker.starts_with("longgen") {
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+    }
     if marker.starts_with("badjson") {
         return Response::builder()
             .header("content-type", "application/json")
@@ -1322,4 +1326,46 @@ fn key_store_never_keeps_the_secret() {
         "grace period"
     );
     assert!(keys::verify(&c, Some(&format!("Bearer {ntok}")), "inference").is_ok());
+}
+
+/// A non-streaming answer arrives only when the whole generation is done, so the first-byte
+/// timeout (a streaming limit) must not cut it; only the request deadline does, as a 504.
+#[tokio::test]
+async fn non_streaming_generation_is_bounded_by_the_request_deadline_not_first_byte() {
+    let e = setup(|c| {
+        c.first_byte_timeout_secs = 1;
+        c.request_deadline_secs = 10;
+    })
+    .await;
+    let r = post_chat(&e, &chat("longgen", false)).await;
+    assert_eq!(r.status(), 200, "cut by the first-byte timeout");
+    let e = setup(|c| {
+        c.first_byte_timeout_secs = 1;
+        c.request_deadline_secs = 1;
+    })
+    .await;
+    let r = post_chat(&e, &chat("longgen", false)).await;
+    assert_eq!(r.status(), 504);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "deadline_exceeded");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (st, outcome): (i64, String) =
+        e.db.query_row(
+            "SELECT status,outcome FROM request_log ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((st, outcome.as_str()), (504, "deadline"));
+}
+
+#[test]
+fn request_deadline_default_fits_a_slow_cpu_reply() {
+    let c = GatewayConfig::default();
+    // ~1 token/s for the default reply, plus prefill.
+    assert!(
+        c.request_deadline_secs >= 1800,
+        "{}",
+        c.request_deadline_secs
+    );
 }

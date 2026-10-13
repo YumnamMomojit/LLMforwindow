@@ -33,7 +33,8 @@ STEP 1  Install Python 3.10 or newer (needed by the Colibri engine)
 -------------------------------------------------------------------
 Download the installer from https://www.python.org/downloads/ , run it and tick
 "Add python.exe to PATH". Do not use the "embeddable package" zip: the engine
-cannot start with it (hub.cmd check says so if it finds one).
+cannot start with it (hub.cmd check says so if it finds one). If the installer
+put Python somewhere hub.cmd does not look, set HUB_PYTHON to its python.exe.
 
 
 STEP 2  Add the Colibri engine
@@ -93,8 +94,14 @@ STEP 4  Start serving (keep this window open)
 Wait for "local API ready". Loading a big model can take minutes.
 Serving stops when you close this window or press Ctrl+C.
 Replies are at most 4096 tokens long; a request that does not say how long gets
-up to 1024. For longer replies start with, for example,
-   hub.cmd serve --model my-model --max-output-tokens 8192
+up to 1024. A model running on the CPU can need a second or more per token, so
+one long reply can take many minutes. Each reply may take up to 60 minutes
+before it is stopped; to allow more (here 2 hours):
+   hub.cmd serve --model my-model --request-deadline 7200
+The model's context window also limits replies: the conversation so far plus the
+reply must fit in it (for many models a few thousand tokens), so a longer
+--max-output-tokens does not help once a conversation is long; /new in chat
+starts a fresh one.
 
 
 Using the graphics card (optional, untested with the Hub)
@@ -125,8 +132,8 @@ you type or paste). To skip that question in this window, first run
    set HUB_API_KEY=lah_...your key...
 If serve runs on another port (--port 8788): hub.cmd chat --url http://127.0.0.1:8788/v1
 Replies stop at 1024 tokens unless you ask for more, up to the serve limit:
-   hub.cmd chat --max-tokens 4096
-A reply that stopped at the limit is marked as such.
+   hub.cmd chat --max-tokens 2048
+A reply that stopped early is marked as such, with the likely reason.
 
 Commands inside chat: /new (fresh conversation), /system TEXT, /exit.
 Ctrl+C stops a reply; at the > prompt it ends the chat. Conversations are saved
@@ -177,8 +184,10 @@ If something goes wrong
                                       this Colibri version (GGUF is not supported)
   Replies are slow                    the model runs on the CPU unless you turn on
                                       the graphics card ("Using the graphics card")
-  Replies stop in mid-sentence        they reached the token limit: hub.cmd chat
-                                      --max-tokens N (and serve --max-output-tokens N)
+  Replies stop in mid-sentence        a token limit or the model's context window was
+                                      reached: /new in chat, or hub.cmd chat --max-tokens N
+  "exceeded its deadline"             the reply took longer than allowed: serve with
+                                      --request-deadline 7200 (seconds), or ask for less
 Full documentation: docs\ (WINDOWS.md, API.md, SECURITY.md, STORAGE.md, VERIFICATION.md).
 
 

@@ -120,7 +120,10 @@ fn missing_words_are_usage_errors_not_panics() {
             &["model", "add", "dir", "--colibri-dir", "c"],
             "--id ID is required",
         ),
-        (&["model", "validate", "dir"], "--colibri-dir C is required"),
+        (
+            &["model", "validate", "dir"],
+            "Colibri not found: put it in a `colibri` folder next to hubd",
+        ),
         (&["serve", "--colibri-dir", "c"], "--model ID is required"),
         (&["secret", "set"], "missing secret name"),
     ] {

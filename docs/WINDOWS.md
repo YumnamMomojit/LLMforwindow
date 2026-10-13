@@ -40,10 +40,15 @@ The bundle is built on Linux, not on Windows: `packaging/make-bundle.sh` (needs 
   umask 002, and a rebuild after `cargo clean -p getrandom -p parking_lot_core -p windows-sys`, gave byte-identical zips and tarballs.
   Another host or toolchain version has not been compared.
 
-`hub.cmd` finds Python in this order: `HUB_PYTHON`, `python\python.exe` next to it (full install only), `py -3`, `python` on PATH
-(3.10 or newer); and Colibri: `HUB_COLIBRI_DIR`, `colibri\openai_server.py`, `colibri\c\openai_server.py`, or one folder level below
-`colibri\`. `hub.cmd check` shows what it found and runs that Python. It keeps delayed expansion off, so a `!` in a path or argument
-survives, and works from folders with spaces, `&` and parentheses (tested under Wine's `cmd`).
+`hub.cmd` only runs `hubd.exe` with your arguments (delayed expansion off, so a `!` in an argument survives). `hubd` itself finds
+Python, in this order: `--python`/`HUB_PYTHON`, `python\python.exe` next to hubd.exe, the `py -3` launcher, `python` on PATH. A
+candidate is used only if it is 3.10 or newer and imports a script's own folder (the embeddable package's `._pth` file prevents
+that, and the engine would not start). Python is run with `-X utf8` and answers in UTF-8, so a profile folder like
+`C:\Users\José` comes back intact (an earlier `for /f` in hub.cmd decoded it with the console code page and garbled it).
+Colibri: `--colibri-dir`/`HUB_COLIBRI_DIR`, else `colibri\` next to hubd.exe (flat release layout or `c\`), or one folder level
+below it. `hub.cmd check` (= `hubd check`) shows what was found and why anything was skipped; it exits 1 until both are there.
+Tested on Linux (non-ASCII folder, stand-ins for old and embeddable Pythons) and under Wine's `cmd` from a folder with spaces,
+`&`, `(x86)` and non-ASCII characters; not on Windows.
 
 ## First run, models
 From the unzipped bundle folder, in a Command Prompt (README-FIRST.txt has the full walk-through):

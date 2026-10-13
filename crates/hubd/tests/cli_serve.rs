@@ -699,7 +699,7 @@ fn max_output_tokens_caps_engine_and_gateway_and_chat_says_so() {
     assert!(out.contains("max_tokens=77"), "{out}");
     assert!(out.contains(cut), "{out}");
     assert!(
-        out.contains("the server limits replies to 77 tokens, fewer than the 5000 asked for"),
+        out.contains("the reply stopped after 77 of the 5000 tokens asked for"),
         "{out}"
     );
     // No --max-tokens: the server's default, itself within the cap.

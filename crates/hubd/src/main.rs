@@ -1,5 +1,6 @@
 //! hubd - headless Local AI Hub service/CLI. The desktop shell calls the same hub-core APIs.
 mod local;
+mod setup;
 use anyhow::{anyhow, bail, Context, Result};
 use hub_core::engine::{ColibriAdapter, ColibriConfig, EngineState, InferenceAdapter};
 use hub_core::gateway::{Gateway, GatewayConfig};
@@ -14,6 +15,7 @@ const USAGE_TEXT: &str = "hubd - Local AI Hub
 
 USAGE: hubd [--data-dir DIR] <command>
 
+  check [--colibri-dir C] [--python P]  show which Python and Colibri are used, and what is missing
   init                                   create data folders and database
   model validate <dir> [--colibri-dir C] [--python P]
   model add <dir> --id ID [--colibri-dir C] [--python P]  (references in place; no copy)
@@ -22,10 +24,12 @@ USAGE: hubd [--data-dir DIR] <command>
   key list | key revoke <id> | key rotate <id> [--grace-hours N]   (N = 0..720, default 24)
   secret set tunnel_token               (reads one line from stdin; typing at a terminal is hidden)
   serve --model ID [--colibri-dir C] [--python P] [--port N] [--max-active N]
-        [--startup-timeout SECS] [--max-output-tokens N]
+        [--startup-timeout SECS] [--max-output-tokens N] [--request-deadline SECS]
         [--share --cloudflared EXE --hostname H --i-authorize-public-sharing]
                                          --max-output-tokens: longest reply the API gives, in tokens
                                          (1..32768, default {MAX_OUT}); a request without max_tokens gets {DEFAULT_OUT}
+                                         --request-deadline: longest a single reply may take
+                                         (60..86400 s, default {DEADLINE}); slow CPU engines need minutes per reply
   purge                                  apply history/log retention
   chat [--model ID] [--system TEXT] [--max-tokens N] [--no-history] [--url http://127.0.0.1:8787/v1]
                                          terminal chat with the running local API (key from $HUB_API_KEY or a
@@ -39,7 +43,8 @@ USAGE: hubd [--data-dir DIR] <command>
   backup <dest.db>                       consistent database snapshot (no keys, no request log)
   help | --help | -h                     show this text and do nothing else
 
---colibri-dir defaults to $HUB_COLIBRI_DIR; --python to $HUB_PYTHON, else python3 (python.exe) on PATH.
+--colibri-dir defaults to $HUB_COLIBRI_DIR, else a `colibri` folder next to hubd; --python to $HUB_PYTHON,
+else the first Python 3.10+ found (Windows: a python folder next to hubd, the py launcher, python).
 Local only by default. Sharing starts only with --share AND --i-authorize-public-sharing.";
 
 /// Longest key lifetime `key create --expires-days` accepts (10 years).
@@ -62,6 +67,7 @@ fn usage() -> String {
     USAGE_TEXT
         .replace("{MAX_OUT}", &d.max_output_tokens.to_string())
         .replace("{DEFAULT_OUT}", &d.default_output_tokens.to_string())
+        .replace("{DEADLINE}", &d.request_deadline_secs.to_string())
 }
 
 /// Bounds of `serve --max-output-tokens`.
@@ -143,15 +149,28 @@ fn path_arg(args: &mut Args, flag: &str, env: &str) -> Result<Option<PathBuf>> {
         .map(PathBuf::from))
 }
 
+/// `--colibri-dir`, else `HUB_COLIBRI_DIR`, else a `colibri` folder next to hubd.
 fn colibri_arg(args: &mut Args) -> Result<PathBuf> {
-    path_arg(args, "--colibri-dir", "HUB_COLIBRI_DIR")?
-        .ok_or_else(|| usage_error("--colibri-dir C is required (or set HUB_COLIBRI_DIR)"))
+    if let Some(p) = path_arg(args, "--colibri-dir", "HUB_COLIBRI_DIR")? {
+        return Ok(p);
+    }
+    setup::find_colibri().ok_or_else(|| {
+        usage_error(
+            "Colibri not found: put it in a `colibri` folder next to hubd, \
+             or pass --colibri-dir C (or set HUB_COLIBRI_DIR); `hubd check` shows what is missing",
+        )
+    })
 }
 
+/// `--python`, else `HUB_PYTHON`, else the first usable Python found (see `setup`).
 fn python_arg(args: &mut Args) -> Result<PathBuf> {
-    Ok(resolve_exe(
-        path_arg(args, "--python", "HUB_PYTHON")?.unwrap_or_else(default_python),
-    ))
+    Ok(match path_arg(args, "--python", "HUB_PYTHON")? {
+        Some(p) => resolve_exe(p),
+        None => setup::find_python()
+            .0
+            .map(|p| p.exe)
+            .unwrap_or_else(default_python),
+    })
 }
 
 fn data_dir(args: &mut Args) -> Result<PathBuf> {
@@ -290,6 +309,12 @@ async fn run() -> Result<()> {
     // Every arm parses all of its arguments before touching the data directory.
     match cmd.as_str() {
         "help" => println!("{}", usage()),
+        "check" => {
+            let colibri = path_arg(&mut args, "--colibri-dir", "HUB_COLIBRI_DIR")?;
+            let python = path_arg(&mut args, "--python", "HUB_PYTHON")?.map(resolve_exe);
+            args.finish()?;
+            setup::check(&dir, python, colibri)?
+        }
         "init" => {
             args.finish()?;
             for d in ["", "workspaces", "exports", "cache", "logs", "secrets"] {
@@ -521,6 +546,8 @@ struct ServeOpts {
     startup_timeout: Duration,
     /// The gateway's cap on a reply and the engine's `--max-tokens`, kept equal.
     max_output_tokens: u32,
+    /// The gateway's whole-reply deadline (streaming and not).
+    request_deadline_secs: u64,
     share: Option<ShareOpts>,
 }
 
@@ -549,6 +576,10 @@ impl ServeOpts {
             Some(v) => bounded("--max-output-tokens", &v, 1, MAX_OUTPUT_TOKENS)? as u32,
             None => GatewayConfig::default().max_output_tokens,
         };
+        let request_deadline_secs = match args.value("--request-deadline")? {
+            Some(v) => bounded("--request-deadline", &v, 60, 86_400)? as u64,
+            None => GatewayConfig::default().request_deadline_secs,
+        };
         let share = args.switch("--share");
         let consent = args.switch("--i-authorize-public-sharing");
         let cloudflared = args.value("--cloudflared")?;
@@ -571,6 +602,7 @@ impl ServeOpts {
             max_active,
             startup_timeout: Duration::from_secs(startup_timeout),
             max_output_tokens,
+            request_deadline_secs,
             share,
         })
     }
@@ -725,6 +757,7 @@ async fn serve(dir: &Path, db_path: &Path, o: ServeOpts) -> Result<()> {
                     db_path: db_path.to_path_buf(),
                     max_active: o.max_active,
                     max_output_tokens: o.max_output_tokens,
+                    request_deadline_secs: o.request_deadline_secs,
                     ..Default::default()
                 };
                 serve_ready(&engine, &mut shutdown, gw, internal, share).await

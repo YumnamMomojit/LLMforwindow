@@ -22,7 +22,7 @@ Errors: `{"error":{"message","type","code"}}`. 400 validation/`context_length_ex
 (per key, 30/min default) / `queue_full` (+`Retry-After`), 503 `engine_unavailable`/`queue_timeout`/`engine_busy`, 504 deadline/`stream_stalled`.
 Mid-stream failures are reported as a final `data: {"error":...}` event followed by `[DONE]`. This includes an upstream stream that ends without `[DONE]` (`engine_error`, "The model stream ended unexpectedly."); clients must treat a stream as complete only after `[DONE]` with no preceding error event.
 Request-log outcomes: `ok`, `rejected`, `cancelled` (client left), `deadline`, `idle_timeout`, `engine_error`, `upstream_error`, `truncated` (upstream ended without `[DONE]`), `client_stalled` (client stopped reading for the idle timeout; the slot is released and the response is aborted: the connection closes without the chunked terminator, so the client sees a failed transfer rather than a clean end).
-Defaults: 1 active generation, 4 queued, queue wait 30 s, first-byte wait 600 s, stream idle 120 s, total 900 s.
+Defaults: 1 active generation, 4 queued, queue wait 30 s, first-byte wait 600 s (streaming), stream idle 120 s, total 3600 s per reply (`serve --request-deadline`).
 While waiting for the first token, streams emit `: keepalive` SSE comments every 15 s — clients must ignore comment lines.
 A reply cut at its `max_tokens` limit ends with `finish_reason: "length"`; check it rather than assuming the answer is complete.
 No HTTP keep-alive: every response carries `Connection: close` and the connection closes after it, so each request opens a new connection.

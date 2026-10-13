@@ -378,6 +378,8 @@ impl ColibriAdapter {
             .env("PYTHONUTF8", "1")
             .env("PYTHONIOENCODING", "utf-8")
             .env_remove("COLI_MODEL")
+            // openai_server.py imports the files next to it; PYTHONSAFEPATH would stop that.
+            .env_remove("PYTHONSAFEPATH")
             .current_dir(&p.colibri_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
