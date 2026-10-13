@@ -27,6 +27,10 @@
 ## Threat model (honest limits)
 * Protects against: remote clients with leaked/revoked/expired/no keys; clients probing admin/upstream routes; oversized/malformed
   input; queue flooding (bounded, 429); path traversal in the storage API; accidental exposure of the raw engine.
+* Connection limits keep clients without a key from holding the gateway's connection places (a connection that has not sent a
+  request gives way to a new one; every connection carries one request), but they cannot stop a local process, or a LAN peer when
+  `allow_non_loopback` is set, that floods new connections at hundreds of thousands per second. Internet exposure relies on
+  Cloudflare's edge for flood protection.
 * Does **not** protect against: a malicious or compromised Windows administrator or owner account (DPAPI is user-scoped, same user can unwrap);
   malware in the user session; a malicious model/engine build (weights are data, but engine native code is trusted);
   the tunnel provider, which terminates TLS and can read plaintext prompts/outputs; SSD secure erase (deletes are not secure wipes).
