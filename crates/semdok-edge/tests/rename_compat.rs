@@ -53,20 +53,40 @@ fn a_fresh_install_uses_the_new_data_folder() {
 #[test]
 fn an_existing_local_ai_hub_folder_keeps_being_used() {
     let home = scratch("legacy");
-    std::fs::create_dir_all(home.join(".local/share/local-ai-hub")).unwrap();
-    let o = run(&home, &[], &["init"]);
+    let old = home.join(".local/share/local-ai-hub");
+    let new = home.join(".local/share/semdok-edge");
+    // A data folder from before the rename, with its database.
+    let o = run(&home, &[("SEMDOK_DATA_DIR", &old)], &["init"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(
-        home.join(".local/share/local-ai-hub/hub.db").is_file(),
-        "{}",
-        stdout(&o)
-    );
-    assert!(!home.join(".local/share/semdok-edge").exists());
-    // Once the new folder exists, it wins.
-    std::fs::create_dir_all(home.join(".local/share/semdok-edge")).unwrap();
-    let o = run(&home, &[], &["init"]);
+    let o = run(&home, &[], &["key", "create", "kept"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!new.exists(), "the old folder was not used");
+    // An empty new folder (made by anything else) must not hide the old data.
+    std::fs::create_dir_all(&new).unwrap();
+    let o = run(&home, &[], &["key", "list"]);
+    assert!(stdout(&o).contains("kept"), "{}", stdout(&o));
+    // Once the new folder has its own database, it wins.
+    let o = run(&home, &[("SEMDOK_DATA_DIR", &new)], &["init"]);
     assert!(o.status.success());
-    assert!(home.join(".local/share/semdok-edge/hub.db").is_file());
+    let o = run(&home, &[], &["key", "list"]);
+    assert!(!stdout(&o).contains("kept"), "{}", stdout(&o));
+}
+
+#[test]
+fn an_empty_legacy_variable_is_named_in_the_error() {
+    let home = scratch("empty-env");
+    let o = Command::new(env!("CARGO_BIN_EXE_semdok-edge"))
+        .args(["key", "list"])
+        .env("HOME", &home)
+        .env_remove("SEMDOK_DATA_DIR")
+        .env("HUB_DATA_DIR", "")
+        .env("RUST_BACKTRACE", "0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("HUB_DATA_DIR is set but empty"), "{e}");
 }
 
 #[test]

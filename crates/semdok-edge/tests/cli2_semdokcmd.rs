@@ -35,6 +35,7 @@ fn semdok_cmd_keeps_bangs_with_delayed_expansion_on() {
                 data.display()
             ))
             .env_remove("SEMDOK_DATA_DIR")
+            .env_remove("HUB_DATA_DIR")
             .output()
             .unwrap();
         assert!(

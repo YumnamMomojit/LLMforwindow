@@ -113,8 +113,11 @@ fn semdok(data: &Path) -> Command {
         .arg(data)
         .env("RUST_BACKTRACE", "0")
         .env_remove("SEMDOK_DATA_DIR")
+        .env_remove("HUB_DATA_DIR")
         .env_remove("SEMDOK_PYTHON")
+        .env_remove("HUB_PYTHON")
         .env_remove("SEMDOK_COLIBRI_DIR")
+        .env_remove("HUB_COLIBRI_DIR")
         .stdin(Stdio::null());
     c
 }

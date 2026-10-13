@@ -184,11 +184,14 @@ fn data_dir(args: &mut Args) -> Result<PathBuf> {
     if let Some(v) = args.value("--data-dir")? {
         return Ok(PathBuf::from(v));
     }
-    if let Some(v) = env_os("SEMDOK_DATA_DIR") {
-        if v.is_empty() {
-            bail!("SEMDOK_DATA_DIR is set but empty");
+    // Named one by one so an empty value is reported under the name that was actually set.
+    for name in ["SEMDOK_DATA_DIR", "HUB_DATA_DIR"] {
+        if let Some(v) = std::env::var_os(name) {
+            if v.is_empty() {
+                bail!("{name} is set but empty");
+            }
+            return Ok(PathBuf::from(v));
         }
-        return Ok(PathBuf::from(v));
     }
     let (base, name, legacy) = if cfg!(windows) {
         let b = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into()));
@@ -199,9 +202,12 @@ fn data_dir(args: &mut Args) -> Result<PathBuf> {
         (b, "semdok-edge", "local-ai-hub")
     };
     // Data written before the rename to Semdok Edge stays where it is and keeps being used
-    // (keys, history, workspaces); a fresh install gets the new folder.
+    // (keys, history, workspaces) for as long as the new folder holds no database of its own,
+    // so an empty SemdokEdge folder made by anything else cannot hide it. A fresh install gets
+    // the new folder.
     let (new, old) = (base.join(name), base.join(legacy));
-    Ok(if !new.exists() && old.is_dir() {
+    let db = "hub.db";
+    Ok(if !new.join(db).is_file() && old.join(db).is_file() {
         old
     } else {
         new

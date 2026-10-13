@@ -1,5 +1,5 @@
 SEMDOK EDGE 0.1.0 for Windows 11 x64 -- READ ME FIRST
-====================================================
+=====================================================
 
 What this is
 ------------
@@ -105,7 +105,7 @@ starts a fresh one.
 
 
 Using the graphics card (optional, untested with Semdok Edge)
----------------------------------------------------------
+-------------------------------------------------------------
 The engines in the Colibri Windows release can use the graphics card through
 Vulkan, but only when the variable COLI_VULKAN is 1. semdok.cmd does not set it,
 so by default everything runs on the CPU. To try the GPU, serve like this
@@ -161,7 +161,9 @@ STEP 7  Save files locally
    semdok.cmd workspace get "Project A" report.pdf C:\Users\me\Desktop\report.pdf
    semdok.cmd workspace export "Project A" C:\Users\me\Desktop\project-a.zip
 get and export never replace an existing file; add --overwrite to replace it.
-Files are stored under %LOCALAPPDATA%\SemdokEdge\workspaces. API keys cannot reach them.
+Files are stored in the "workspaces" folder of the data folder that
+"semdok.cmd check" shows (normally %LOCALAPPDATA%\SemdokEdge; if you used the
+earlier "Local AI Hub" preview, %LOCALAPPDATA%\LocalAIHub). API keys cannot reach them.
 
 
 Sharing over the internet (optional, off by default)
@@ -173,7 +175,7 @@ To stop sharing, stop "semdok.cmd serve" (Ctrl+C). Local use does not need any o
 
 If something goes wrong
 -----------------------
-  semdok.cmd check                       what was found
+  semdok.cmd check                    what was found, and where your data is
   "Not enough memory ..."             close programs, pick a smaller model, or set
                                       RAM_GB=<gigabytes> before semdok.cmd serve
   "port 8787 on 127.0.0.1 is not      semdok.cmd serve --model my-model --port 8788

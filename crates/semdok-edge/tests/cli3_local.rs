@@ -35,6 +35,7 @@ impl Scratch {
             .args(args)
             .env("RUST_BACKTRACE", "0")
             .env_remove("SEMDOK_DATA_DIR")
+            .env_remove("HUB_DATA_DIR")
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -146,6 +147,7 @@ fn workspace_get_to_redirected_stdout_is_an_exact_copy() {
         ])
         .env("RUST_BACKTRACE", "0")
         .env_remove("SEMDOK_DATA_DIR")
+        .env_remove("HUB_DATA_DIR")
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&out).unwrap())
         .stderr(Stdio::piped())
@@ -223,7 +225,9 @@ fn on_pty(cfg: serde_json::Value, semdok_args: &[&str], data: &Path) -> serde_js
         .args(semdok_args)
         .env("RUST_BACKTRACE", "0")
         .env_remove("SEMDOK_API_KEY")
+        .env_remove("HUB_API_KEY")
         .env_remove("SEMDOK_DATA_DIR")
+        .env_remove("HUB_DATA_DIR")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));

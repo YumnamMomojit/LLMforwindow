@@ -43,7 +43,8 @@ impl Scratch {
             .args(args)
             .env("RUST_BACKTRACE", "0")
             .env("SEMDOK_API_KEY", KEY)
-            .env_remove("SEMDOK_DATA_DIR");
+            .env_remove("SEMDOK_DATA_DIR")
+            .env_remove("HUB_DATA_DIR");
         c
     }
 }

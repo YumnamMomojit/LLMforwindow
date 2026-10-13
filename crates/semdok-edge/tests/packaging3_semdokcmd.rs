@@ -34,7 +34,9 @@ fn semdok_cmd_check_runs_semdok_check_and_finds_a_nested_colibri() {
             root.join("semdok.cmd").display()
         ))
         .env_remove("SEMDOK_PYTHON")
+        .env_remove("HUB_PYTHON")
         .env_remove("SEMDOK_COLIBRI_DIR")
+        .env_remove("HUB_COLIBRI_DIR")
         .env("SEMDOK_DATA_DIR", root.join("data"))
         .output()
         .unwrap();

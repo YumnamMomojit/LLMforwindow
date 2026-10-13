@@ -44,8 +44,11 @@ fn semdok(data: &Path, args: &[&str], stdin: &str) -> Out {
         .args(args)
         .env("RUST_BACKTRACE", "0")
         .env_remove("SEMDOK_DATA_DIR")
+        .env_remove("HUB_DATA_DIR")
         .env_remove("SEMDOK_PYTHON")
+        .env_remove("HUB_PYTHON")
         .env_remove("SEMDOK_COLIBRI_DIR")
+        .env_remove("HUB_COLIBRI_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -216,6 +219,7 @@ fn flags_without_values_are_errors_not_defaults() {
     let o = Command::new(env!("CARGO_BIN_EXE_semdok-edge"))
         .args(["init", "--data-dir"])
         .env_remove("SEMDOK_DATA_DIR")
+        .env_remove("HUB_DATA_DIR")
         .current_dir(&s.0)
         .output()
         .unwrap();

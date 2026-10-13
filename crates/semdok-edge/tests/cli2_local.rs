@@ -34,6 +34,7 @@ impl Scratch {
             .args(args)
             .env("RUST_BACKTRACE", "0")
             .env_remove("SEMDOK_DATA_DIR")
+            .env_remove("HUB_DATA_DIR")
             .stdin(Stdio::null());
         c
     }
@@ -245,6 +246,7 @@ fn on_pty(prompt: &str, input: &str, semdok_args: &[&str], data: &Path) -> serde
         .args(semdok_args)
         .env("RUST_BACKTRACE", "0")
         .env_remove("SEMDOK_API_KEY")
+        .env_remove("HUB_API_KEY")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", stderr(&o));
