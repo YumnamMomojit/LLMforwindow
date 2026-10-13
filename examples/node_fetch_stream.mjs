@@ -1,9 +1,9 @@
-// Node 18+. Env: HUB_BASE_URL, HUB_API_KEY, HUB_MODEL
-const { HUB_BASE_URL, HUB_API_KEY, HUB_MODEL } = process.env;
-const res = await fetch(`${HUB_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
+// Node 18+. Env: SEMDOK_BASE_URL, SEMDOK_API_KEY, SEMDOK_MODEL
+const { SEMDOK_BASE_URL, SEMDOK_API_KEY, SEMDOK_MODEL } = process.env;
+const res = await fetch(`${SEMDOK_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
   method: "POST",
-  headers: { Authorization: `Bearer ${HUB_API_KEY}`, "Content-Type": "application/json" },
-  body: JSON.stringify({ model: HUB_MODEL, stream: true, max_tokens: 64,
+  headers: { Authorization: `Bearer ${SEMDOK_API_KEY}`, "Content-Type": "application/json" },
+  body: JSON.stringify({ model: SEMDOK_MODEL, stream: true, max_tokens: 64,
     messages: [{ role: "user", content: "Say hello." }] }),
   signal: AbortSignal.timeout(600_000), // explicit timeout; abort() also cancels generation
 });

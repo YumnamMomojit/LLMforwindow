@@ -442,52 +442,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "hub-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bytes",
- "fs4",
- "futures-util",
- "getrandom 0.3.4",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "windows-sys 0.59.0",
- "zip",
-]
-
-[[package]]
-name = "hubd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fs4",
- "futures-util",
- "hub-core",
- "libc",
- "reqwest",
- "serde_json",
- "tokio",
- "url",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "hyper"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -925,6 +879,52 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semdok-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "fs4",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "windows-sys 0.59.0",
+ "zip",
+]
+
+[[package]]
+name = "semdok-edge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "futures-util",
+ "libc",
+ "reqwest",
+ "semdok-core",
+ "serde_json",
+ "tokio",
+ "url",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "serde"

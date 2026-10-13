@@ -12,16 +12,16 @@
    `logprobs`, `response_format`, images/audio, `x_colibri_*` and unknown fields → 400. `seed/user/store/metadata/service_tier`
    are dropped (accepted, ignored). Model must equal the served id.
 4. **No forwarded-header trust**: `X-Forwarded-*` is ignored; limits are per key, not per IP. Optional `allowed_hosts` Host check.
-5. **Keys**: `lah_<id>_<secret>`; secret 256-bit CSPRNG, shown once, only SHA-256 stored; expiry/revoke/rotate; scope `inference` only.
+5. **Keys**: `sem_<id>_<secret>` (keys made before the rename, `lah_<id>_<secret>`, keep working); secret 256-bit CSPRNG, shown once, only SHA-256 stored; expiry/revoke/rotate; scope `inference` only.
    Revocation is a flag and ignores the clock; expiry and rotation grace periods follow the system clock. The upgrade to schema v3
    decided once, by the clock at that moment, which old grace periods had ended (STORAGE.md).
 6. **Logs**: time, key id, model, status, outcome, queue/first-byte/total ms, upstream-reported usage. No prompts/completions.
-   Engine/tunnel log tails are redacted of the internal key / tunnel token. Retention via `hubd purge` (30 days default for request log).
+   Engine/tunnel log tails are redacted of the internal key / tunnel token. Retention via `semdok-edge purge` (30 days default for request log).
 7. **Filesystem**: all workspace I/O through `storage.rs` (component allowlist, Windows reserved names, ADS `:` rejected, symlink/reparse-point
    ancestors rejected, canonical-prefix check, atomic temp+rename, quota & free-space reserve during write). Uploaded files are never extracted or executed.
-8. **Model output is inert text** (history export is plain text). Tool calls are rejected at the gateway. `hubd chat` and
-   `hubd history` strip terminal control characters (C0/C1, so no escape sequences) from replies, thinking, server error messages,
-   model ids and conversation titles before printing them. `hubd chat` sends its key only to plain-http loopback URLs
+8. **Model output is inert text** (history export is plain text). Tool calls are rejected at the gateway. `semdok-edge chat` and
+   `semdok-edge history` strip terminal control characters (C0/C1, so no escape sequences) from replies, thinking, server error messages,
+   model ids and conversation titles before printing them. `semdok-edge chat` sends its key only to plain-http loopback URLs
    (`localhost` is pinned to 127.0.0.1/::1, no proxy, redirects are never followed); keys and the tunnel token typed at a terminal are not echoed.
 
 ## Threat model (honest limits)
@@ -36,5 +36,5 @@
   the tunnel provider, which terminates TLS and can read plaintext prompts/outputs; SSD secure erase (deletes are not secure wipes).
 * Integrity checks of downloads show bytes match a published hash, not publisher authenticity.
 * Tauri hardening (capabilities, CSP) applies to the future desktop shell; it is **not implemented yet**. Upstream's stub CSP allows
-  `connect-src http://127.0.0.1:*` and must be tightened when the Hub shell is added.
+  `connect-src http://127.0.0.1:*` and must be tightened when Semdok Edge shell is added.
 * Unverified: Job Object behaviour and DPAPI on a real Windows host.

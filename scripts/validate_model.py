@@ -23,7 +23,7 @@ def main():
         r = fr.resolve_model(sys.argv[2])
         d = r.descriptor
         # FamilyDescriptor.modality: "text" for the chat engines, "image" (Qwen-Image) or
-        # "decision" (Laya, GLiNER2.5-Decide). The Hub accepts "text" only. Registries from
+        # "decision" (Laya, GLiNER2.5-Decide). Semdok Edge accepts "text" only. Registries from
         # before the field existed had chat families only, hence the default.
         modality = getattr(d, "modality", "text")
         print(json.dumps({

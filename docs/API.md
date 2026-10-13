@@ -1,6 +1,6 @@
 # Local/remote API
 
-Base URL: `http://127.0.0.1:8787/v1` locally; `https://<your-hostname>/v1` when sharing. Auth: `Authorization: Bearer lah_...`.
+Base URL: `http://127.0.0.1:8787/v1` locally; `https://<your-hostname>/v1` when sharing. Auth: `Authorization: Bearer sem_...`.
 Model ID: the catalog id you served (`GET /v1/models` returns exactly that one, and only while the engine is ready).
 
 | Endpoint | Notes |
@@ -9,7 +9,7 @@ Model ID: the catalog id you served (`GET /v1/models` returns exactly that one, 
 | `POST /v1/chat/completions` | JSON or SSE (`stream:true`) |
 
 Supported: roles `system`/`user`/`assistant` (string or `[{type:"text"}]` content), `max_tokens`/`max_completion_tokens`
-(default 1024, clamped to 4096; `hubd serve --max-output-tokens N` sets the clamp, and a lower N lowers the default too), `temperature` 0–2, `top_p` 0–1, `stop` (≤4 strings), `stream`, `stream_options.include_usage`, `n=1`.
+(default 1024, clamped to 4096; `semdok-edge serve --max-output-tokens N` sets the clamp, and a lower N lowers the default too), `temperature` 0–2, `top_p` 0–1, `stop` (≤4 strings), `stream`, `stream_options.include_usage`, `n=1`.
 A trailing `assistant` message is *continued* by the upstream (documented upstream behaviour).
 Accepted but **ignored**: `seed`, `user`, `store`, `metadata`, `service_tier`. **Rejected (400)**: everything else, incl. tools,
 logprobs, response_format, images, audio, `n>1`, penalties. Not offered: embeddings, completions, Responses API, tool execution,

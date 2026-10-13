@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Real-engine protocol test on Linux/macOS/Git-Bash: pinned upstream Colibri engine + its
-# random-weight MiMo fixture, driven through hubd and the restricted gateway by real clients.
+# random-weight MiMo fixture, driven through semdok-edge and the restricted gateway by real clients.
 # The fixture proves the plumbing end to end; its output is NOT meaningful text.
 # Asserted: every client exits 0 and shows its protocol markers (models list, streamed chunks,
-# `data: [DONE]`, usage, non-empty text); verify_remote passes; hubd exits 0 on SIGINT and, in a
+# `data: [DONE]`, usage, non-empty text); verify_remote passes; semdok-edge exits 0 on SIGINT and, in a
 # second run, on SIGTERM, and no engine process survives either. The temp dir is removed on
 # every exit path.
-#   COLIBRI_DIR=/path/to/colibri-checkout [HUB_E2E_PORT=18787] scripts/e2e_real_fixture.sh
+#   COLIBRI_DIR=/path/to/colibri-checkout [SEMDOK_E2E_PORT=18787] scripts/e2e_real_fixture.sh
 set -euo pipefail
 : "${COLIBRI_DIR:?set COLIBRI_DIR to the pinned colibri checkout (see docs/UPSTREAM.md)}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="${HUB_E2E_PORT:-18787}"
+PORT="${SEMDOK_E2E_PORT:-18787}"
 PY="${PYTHON:-python3}"
 WORK="$(mktemp -d)"
-HUBD_PID=""
-# The engine tree of the running hubd (launcher, C engine, ...) and their process groups,
+EDGE_PID=""
+# The engine tree of the running semdok-edge (launcher, C engine, ...) and their process groups,
 # recorded while it serves: the C engine gets the model path through its environment, so
 # its command line (`<colibri>/mimo <cap>`) never names $WORK and pgrep -f cannot find it.
 ENGINE_PIDS=""; ENGINE_PGIDS=""
@@ -26,10 +26,10 @@ alive() { local s; s=$(ps -p "$1" -o stat= 2>/dev/null) || return 1; case "$s" i
 # descendants PID: every process below PID.
 descendants() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
 
-# engine_tree: remember the running hubd's engine tree and its process groups.
+# engine_tree: remember the running semdok-edge's engine tree and its process groups.
 engine_tree() {
   local p
-  ENGINE_PIDS=$(descendants "$HUBD_PID")
+  ENGINE_PIDS=$(descendants "$EDGE_PID")
   ENGINE_PGIDS=$(for p in $ENGINE_PIDS; do ps -o pgid= -p "$p" || true; done | tr -d ' ' | { grep -vx "$MY_PGID" || true; } | sort -u)
 }
 
@@ -37,7 +37,7 @@ engine_tree() {
 record_engine() {
   local p
   engine_tree
-  [ -n "$ENGINE_PIDS" ] || fail "hubd has no engine processes while serving"
+  [ -n "$ENGINE_PIDS" ] || fail "semdok-edge has no engine processes while serving"
   for p in $ENGINE_PIDS; do
     [ "$(ps -o pgid= -p "$p" | tr -d ' ')" != "$MY_PGID" ] || fail "an engine process is in the test script's process group"
   done
@@ -52,20 +52,20 @@ survivors() {
   } | sort -u | while read -r p; do if [ -n "$p" ] && alive "$p"; then echo "$p"; fi; done
 }
 
-# stop_hubd SIGNAL: signal hubd, wait up to 30 s, SIGKILL it if it hangs; returns hubd's exit status.
-stop_hubd() {
-  local pid=$HUBD_PID rc=0
-  HUBD_PID=""
+# stop_edge SIGNAL: signal semdok-edge, wait up to 30 s, SIGKILL it if it hangs; returns semdok-edge's exit status.
+stop_edge() {
+  local pid=$EDGE_PID rc=0
+  EDGE_PID=""
   kill -"$1" "$pid" 2>/dev/null || true
   for _ in $(seq 30); do alive "$pid" || break; sleep 1; done
-  if alive "$pid"; then echo "hubd ignored SIG$1 for 30 s; killing it"; kill -KILL "$pid" 2>/dev/null || true; fi
+  if alive "$pid"; then echo "semdok-edge ignored SIG$1 for 30 s; killing it"; kill -KILL "$pid" 2>/dev/null || true; fi
   wait "$pid" || rc=$?
   return "$rc"
 }
 
 cleanup() {
   local p
-  if [ -n "$HUBD_PID" ]; then engine_tree; stop_hubd INT || true; fi
+  if [ -n "$EDGE_PID" ]; then engine_tree; stop_edge INT || true; fi
   # Last resort only (orphans already failed the run): what is left of the engine tree.
   for p in $(survivors); do kill -KILL "$p" 2>/dev/null || true; done
   rm -rf "$WORK"
@@ -75,31 +75,31 @@ trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 
 fail() {
   echo "FAIL: $*"
-  if [ -f "$WORK/hubd.log" ]; then echo "--- hubd log (tail)"; tail -n 40 "$WORK/hubd.log"; fi
+  if [ -f "$WORK/semdok-edge.log" ]; then echo "--- semdok-edge log (tail)"; tail -n 40 "$WORK/semdok-edge.log"; fi
   exit 1
 }
 
-# start_hubd [COLIBRI]: defaults to the source checkout; the release-layout run passes a flat folder.
-start_hubd() {
-  "$H" serve --model fixture --colibri-dir "${1:-$COLIBRI_DIR}" --port "$PORT" >"$WORK/hubd.log" 2>&1 &
-  HUBD_PID=$!
+# start_edge [COLIBRI]: defaults to the source checkout; the release-layout run passes a flat folder.
+start_edge() {
+  "$H" serve --model fixture --colibri-dir "${1:-$COLIBRI_DIR}" --port "$PORT" >"$WORK/semdok-edge.log" 2>&1 &
+  EDGE_PID=$!
   for _ in $(seq 120); do
-    grep -q "^local API ready" "$WORK/hubd.log" && return 0
-    alive "$HUBD_PID" || fail "hubd exited before it was ready"
+    grep -q "^local API ready" "$WORK/semdok-edge.log" && return 0
+    alive "$EDGE_PID" || fail "semdok-edge exited before it was ready"
     sleep 1
   done
-  fail "hubd not ready after 120 s"
+  fail "semdok-edge not ready after 120 s"
 }
 
-# shutdown_check SIGNAL: hubd must exit 0 and leave no engine process behind (launcher and
+# shutdown_check SIGNAL: semdok-edge must exit 0 and leave no engine process behind (launcher and
 # C engine alike).
 shutdown_check() {
   local rc=0 left
   echo "== SIG$1 shutdown leaves no orphans"
   record_engine
   echo "engine tree: $(for p in $ENGINE_PIDS; do ps -o pid=,args= -p "$p"; done | tr -s ' ' | paste -sd ';' -)"
-  stop_hubd "$1" || rc=$?
-  [ "$rc" -eq 0 ] || fail "hubd exited with status $rc after SIG$1"
+  stop_edge "$1" || rc=$?
+  [ "$rc" -eq 0 ] || fail "semdok-edge exited with status $rc after SIG$1"
   sleep 1
   left=$(survivors)
   if [ -n "$left" ]; then ps -o pid=,pgid=,args= -p "$(echo $left | tr ' ' ,)" || true; fail "orphan engine processes after SIG$1"; fi
@@ -129,15 +129,15 @@ import mimo_serve_fixture as f
 shutil.copytree(f.served_fixture(), sys.argv[2])
 PYEOF
 
-( cd "$HERE" && cargo build -q -p hubd )
-H="$HERE/target/debug/hubd"
-export HUB_DATA_DIR="$WORK/data" RUST_BACKTRACE=0
+( cd "$HERE" && cargo build -q -p semdok-edge )
+H="$HERE/target/debug/semdok-edge"
+export SEMDOK_DATA_DIR="$WORK/data" RUST_BACKTRACE=0
 "$H" init >/dev/null
 "$H" model add "$WORK/model" --id fixture --colibri-dir "$COLIBRI_DIR" >/dev/null
-KEY=$("$H" key create e2e | grep '^lah_') || fail "key create printed no key"
-export HUB_BASE_URL="http://127.0.0.1:$PORT/v1" HUB_API_KEY="$KEY" HUB_MODEL=fixture
+KEY=$("$H" key create e2e | grep '^sem_') || fail "key create printed no key"
+export SEMDOK_BASE_URL="http://127.0.0.1:$PORT/v1" SEMDOK_API_KEY="$KEY" SEMDOK_MODEL=fixture
 
-start_hubd
+start_edge
 client curl sh "$HERE/examples/curl.sh"
 expect curl '"id": ?"fixture"' '"(content|reasoning_content)": ?"[^"]' '^data: \[DONE\]'
 if grep -q '"error"' "$WORK/curl.out"; then fail "curl got an error response"; fi
@@ -148,11 +148,11 @@ client openai_sdk "$PY" "$HERE/examples/python_openai_sdk.py"
 expect openai_sdk "\\['fixture'\\]" 'completion_tokens=[1-9]' '^stream usage: .*completion_tokens=[1-9]'
 client node_fetch node "$HERE/examples/node_fetch_stream.mjs"                # exits nonzero without [DONE]
 expect node_fetch '[^[:space:]]'
-client verify_remote "$PY" "$HERE/scripts/verify_remote.py" --base-url "$HUB_BASE_URL" --api-key "$KEY" --model fixture --allow-http
+client verify_remote "$PY" "$HERE/scripts/verify_remote.py" --base-url "$SEMDOK_BASE_URL" --api-key "$KEY" --model fixture --allow-http
 expect verify_remote '^RESULT: checks pass'
 shutdown_check INT
 
-start_hubd
+start_edge
 shutdown_check TERM
 
 # The official release archive is flat (openai_server.py, its imports and the engines at the
@@ -164,7 +164,7 @@ cp "$COLIBRI_DIR/c/mimo" "$WORK/release/"
 [ ! -d "$WORK/release/c" ] || fail "packed release unexpectedly has a c/ folder"
 "$H" model validate "$WORK/model" --colibri-dir "$WORK/release" >"$WORK/release_validate.out" 2>&1 \
   || { cat "$WORK/release_validate.out"; fail "model validate failed on the release layout"; }
-start_hubd "$WORK/release"
+start_edge "$WORK/release"
 client release_curl sh "$HERE/examples/curl.sh"
 expect release_curl '"id": ?"fixture"' '^data: \[DONE\]'
 shutdown_check INT

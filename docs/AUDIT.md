@@ -18,30 +18,30 @@ Status legend: **Impl** = merged and used as-is; **Reuse** = usable with a wrapp
   4 MiB body cap, single-`Content-Length` framing, bounded queue (`--max-queue`, `--queue-timeout`), cancellation on
   client disconnect (CANCEL sent to engine), SSE, usage counts, refuses non-loopback bind without a key. It is **one
   shared key, no scopes, no per-key limits, and ~dozens of routes** (UI, systemone, completions, Anthropic-style, ...), and
-  CORS defaults/`*` are configurable. It must not be exposed directly → the Hub's restricted gateway.
+  CORS defaults/`*` are configurable. It must not be exposed directly → Semdok Edge's restricted gateway.
 * Layout: the release archives (release.yml "Package" step + `c/tools/pack_python.py`) put `openai_server.py`, its import
-  closure (incl. `family_registry.py`) and the engines **flat at the archive root**; a source checkout keeps them in `c/`. The Hub
+  closure (incl. `family_registry.py`) and the engines **flat at the archive root**; a source checkout keeps them in `c/`. Semdok Edge
   accepts both (`engine::server_script`, `scripts/validate_model.py`); the first build only accepted `c/` and failed on the
   release layout with `ModuleNotFoundError: family_registry` (found while packaging, fixed, tested with a pack_python.py-built folder).
-* The server serialises generation by default (`--kv-slots 1`; 2.0.0 adds up to 16 slots). The Hub keeps 1 active generation.
+* The server serialises generation by default (`--kv-slots 1`; 2.0.0 adds up to 16 slots). Semdok Edge keeps 1 active generation.
 
 ## Capability matrix
 
 | Area | Status | Notes |
 |---|---|---|
 | OpenAI-style `GET /v1/models`, `POST /v1/chat/completions`, SSE, usage | **Impl** (upstream) | verified live against fixture (see VERIFICATION) |
-| Engine families | **Impl** | `family_registry`: glm53, glm, inkling, kimi, olmoe, qwen36 (+Qwen3-Coder, Qwen3.8-27B), qwen38, deepseek_v4, deepseek_v41, mimo, qwen_image (image), laya, gliner_decide (decision). Hub chat supports **text chat families only**; image/decision families are rejected at model validation (`hubd model validate`/`add`) by design. |
+| Engine families | **Impl** | `family_registry`: glm53, glm, inkling, kimi, olmoe, qwen36 (+Qwen3-Coder, Qwen3.8-27B), qwen38, deepseek_v4, deepseek_v41, mimo, qwen_image (image), laya, gliner_decide (decision). Semdok Edge chat supports **text chat families only**; image/decision families are rejected at model validation (`semdok-edge model validate`/`add`) by design. |
 | Model format | **Impl** | HF-style dir: `config.json`, `tokenizer.json`, safetensors shards; some families need an upstream conversion/prep step ("By hand" table). **No GGUF serving** — not assumed. |
 | CPU backend | **Impl** | pure C; no GPU needed |
-| Vulkan backend | **Impl, Unverified here** | in Windows release; runtime-loaded; used only with `COLI_VULKAN=1` in the engine's environment (`coli start` sets it, the Hub does not: set it before `hubd serve`, see WINDOWS.md); without a device most engines continue on the CPU, the GLM engine exits |
-| CUDA | **Not used by the Hub** | separate `-cuda.zip` for RTX 30/40/50 (CC ≥ 8.0); upstream's launcher sets `COLI_CUDA`/`COLI_GPUS` and sizes the VRAM tier with its planner, which the Hub does not run |
-| AMD XDNA NPU | Opt-in, Unverified | not used by Hub |
-| Windows launcher | **Reuse** | `START-HERE.bat`/`coli setup`: interactive, may offer winget Python install, builds with MSYS2 if present. The Hub does **not** run it; it launches `openai_server.py` directly with an argv array. |
-| Model discovery/download | **Reuse, not wired** | `coli setup`/`setup_catalog.py` (HF resume). Hub v0 imports existing dirs; download UI deferred. |
+| Vulkan backend | **Impl, Unverified here** | in Windows release; runtime-loaded; used only with `COLI_VULKAN=1` in the engine's environment (`coli start` sets it, Semdok Edge does not: set it before `semdok-edge serve`, see WINDOWS.md); without a device most engines continue on the CPU, the GLM engine exits |
+| CUDA | **Not used by Semdok Edge** | separate `-cuda.zip` for RTX 30/40/50 (CC ≥ 8.0); upstream's launcher sets `COLI_CUDA`/`COLI_GPUS` and sizes the VRAM tier with its planner, which Semdok Edge does not run |
+| AMD XDNA NPU | Opt-in, Unverified | not used by Semdok Edge |
+| Windows launcher | **Reuse** | `START-HERE.bat`/`coli setup`: interactive, may offer winget Python install, builds with MSYS2 if present. Semdok Edge does **not** run it; it launches `openai_server.py` directly with an argv array. |
+| Model discovery/download | **Reuse, not wired** | `coli setup`/`setup_catalog.py` (HF resume). Semdok Edge v0 imports existing dirs; download UI deferred. |
 | Smallest chat model | — | per upstream README: Qwen3-Coder-30B-A3B 19 GB download (RAM 8/18 GB); OLMoE 7B is "by hand", 14 GB → 7 GB. Not tested here (no weights, no HF access). |
-| Auth / scopes / per-key limits | **Missing upstream** | implemented in Hub gateway |
-| Tauri shell + web UI | **Impl (stub shell)** | no native commands; Hub screens (Dashboard/Models/Chat/Sharing/Storage/Settings) **not built** |
-| Job-object process ownership, DPAPI, tunnels, storage, history | **Missing upstream** | implemented in `hub-core` (Windows parts compile-checked only) |
+| Auth / scopes / per-key limits | **Missing upstream** | implemented in Semdok Edge gateway |
+| Tauri shell + web UI | **Impl (stub shell)** | no native commands; Semdok Edge screens (Dashboard/Models/Chat/Sharing/Storage/Settings) **not built** |
+| Job-object process ownership, DPAPI, tunnels, storage, history | **Missing upstream** | implemented in `semdok-core` (Windows parts compile-checked only) |
 | Release workflow | **Impl** | `.github/workflows/release.yml` builds engines with MSYS2/UCRT64 on `windows-latest` |
 | Open issues/PRs | not reviewed | no GitHub API access to the upstream repo from this session; only merged code at the pinned commit was used |
 

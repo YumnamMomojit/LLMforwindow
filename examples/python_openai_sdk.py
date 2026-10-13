@@ -1,17 +1,17 @@
-"""OpenAI Python SDK against Local AI Hub (Chat Completions only).
+"""OpenAI Python SDK against Semdok Edge (Chat Completions only).
 pip install openai
-  HUB_BASE_URL=https://your-host/v1 HUB_API_KEY=lah_... HUB_MODEL=your-model python python_openai_sdk.py
+  SEMDOK_BASE_URL=https://your-host/v1 SEMDOK_API_KEY=sem_... SEMDOK_MODEL=your-model python python_openai_sdk.py
 """
 import os
 from openai import OpenAI
 
 client = OpenAI(
-    base_url=os.environ["HUB_BASE_URL"],
-    api_key=os.environ["HUB_API_KEY"],
+    base_url=os.environ["SEMDOK_BASE_URL"],
+    api_key=os.environ["SEMDOK_API_KEY"],
     timeout=600.0,      # long prompts can spend minutes in prefill before the first token
     max_retries=2,      # SDK retries 429/5xx with backoff; one generation runs at a time
 )
-model = os.environ["HUB_MODEL"]
+model = os.environ["SEMDOK_MODEL"]
 
 print([m.id for m in client.models.list().data])
 

@@ -1,13 +1,13 @@
 # Storage layout
 
 ```
-%LOCALAPPDATA%\LocalAIHub\        (HUB_DATA_DIR / --data-dir)
+%LOCALAPPDATA%\SemdokEdge\        (SEMDOK_DATA_DIR / --data-dir; an existing %LOCALAPPDATA%\LocalAIHub from before the rename is kept and used)
   hub.db (+ -wal/-shm)            keys (verifiers), models catalog, settings, request log, workspaces, files, conversations
   secrets\                        DPAPI-protected blobs (dev: 0600 files)
   workspaces\<16-hex id>\...      user files (one folder per workspace); .tmp-uploads cleaned at start
-  workspaces.lock                 held by each `hubd workspace`/`backup` command, so they run one at a time (the start-up
+  workspaces.lock                 held by each `semdok-edge workspace`/`backup` command, so they run one at a time (the start-up
                                   clean-up would otherwise delete the upload of a `workspace put` still running elsewhere)
-  exports\  cache\  logs\         reserved areas (created by `hubd init`)
+  exports\  cache\  logs\         reserved areas (created by `semdok-edge init`)
 <models root, user-chosen>        model weights are referenced in place, never copied or deleted
 ```
 SQLite: WAL, `PRAGMA user_version` migrations (v3 now; v3 adds an explicit `revoked` flag so revocation does not depend on the clock); a newer DB than the app refuses to open. Binary files are on disk, never blobs.

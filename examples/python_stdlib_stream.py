@@ -1,7 +1,7 @@
-"""Dependency-free streaming client. Env: HUB_BASE_URL, HUB_API_KEY, HUB_MODEL."""
+"""Dependency-free streaming client. Env: SEMDOK_BASE_URL, SEMDOK_API_KEY, SEMDOK_MODEL."""
 import json, os, sys, urllib.error, urllib.request
 
-base, key, model = os.environ["HUB_BASE_URL"].rstrip("/"), os.environ["HUB_API_KEY"], os.environ["HUB_MODEL"]
+base, key, model = os.environ["SEMDOK_BASE_URL"].rstrip("/"), os.environ["SEMDOK_API_KEY"], os.environ["SEMDOK_MODEL"]
 req = urllib.request.Request(
     base + "/chat/completions",
     data=json.dumps({"model": model, "stream": True, "max_tokens": 64,

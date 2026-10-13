@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Externally runnable verification of a Local AI Hub endpoint (stdlib only).
+"""Externally runnable verification of a Semdok Edge endpoint (stdlib only).
 
-  python verify_remote.py --base-url https://api.example.com/v1 --api-key lah_... --model ID \
+  python verify_remote.py --base-url https://api.example.com/v1 --api-key sem_... --model ID \
       [--from-separate-network]
 
 Run it from a machine on a DIFFERENT network (e.g. a phone hotspot or a cloud VM). A request
@@ -47,7 +47,7 @@ def main():
     except Exception as e:
         check("reachable", False, repr(e)); return finish(results, a)
     check("no key -> 401", req(base + "/models").status == 401)
-    check("bad key -> 401", req(base + "/models", "lah_00000000_bad").status == 401)
+    check("bad key -> 401", req(base + "/models", "sem_00000000_bad").status == 401)
     for p in ["/admin", "/v1/completions", "/v1/embeddings", "/api/models", "/healthz", "/v1/systemone"]:
         s = req(root + p, a.api_key, timeout=30).status
         check(f"blocked route {p}", s in (404, 405), f"status={s}")

@@ -1,7 +1,7 @@
 # Configuration schema
 
-`hubd` takes its settings from flags today; there is **no config-file loader yet**. The schema below is the `GatewayConfig` struct
-(`crates/hub-core/src/gateway.rs`, serde-ready JSON) that a future settings screen/file will persist.
+`semdok-edge` takes its settings from flags today; there is **no config-file loader yet**. The schema below is the `GatewayConfig` struct
+(`crates/semdok-core/src/gateway.rs`, serde-ready JSON) that a future settings screen/file will persist.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -20,6 +20,6 @@
 | rate_limit_per_min | 30 | per key; 0 = off |
 | allowed_hosts | [] | Host allowlist; empty = any |
 
-`hubd serve` flags: `--port` (8787), `--max-active` (1..16, default 1), `--startup-timeout` (seconds to wait for the engine to become ready,
-1..86400, default 900), `--max-output-tokens` (1..32768, default 4096), `--request-deadline` (60..86400 s, default 3600), `--share` group. Data dir: `--data-dir` / `HUB_DATA_DIR`. Engine runtime: `--python` / `HUB_PYTHON` (else the first Python 3.10+ that can run the engine: on Windows a `python` folder next to hubd.exe, the `py` launcher, then `python`; elsewhere `python3`, `python`) and `--colibri-dir` / `HUB_COLIBRI_DIR` (else a `colibri` folder next to hubd, flat, `c\` or one folder deeper); a flag wins over the variable. Unknown flags, extra arguments
+`semdok-edge serve` flags: `--port` (8787), `--max-active` (1..16, default 1), `--startup-timeout` (seconds to wait for the engine to become ready,
+1..86400, default 900), `--max-output-tokens` (1..32768, default 4096), `--request-deadline` (60..86400 s, default 3600), `--share` group. Data dir: `--data-dir` / `SEMDOK_DATA_DIR`. Engine runtime: `--python` / `SEMDOK_PYTHON` (else the first Python 3.10+ that can run the engine: on Windows a `python` folder next to semdok-edge.exe, the `py` launcher, then `python`; elsewhere `python3`, `python`) and `--colibri-dir` / `SEMDOK_COLIBRI_DIR` (else a `colibri` folder next to semdok-edge, flat, `c\` or one folder deeper); a flag wins over the variable. The `HUB_*` names from before the rename to Semdok Edge (`HUB_DATA_DIR`, `HUB_PYTHON`, `HUB_COLIBRI_DIR`, `HUB_API_KEY`) are still read when the `SEMDOK_*` one is unset. Unknown flags, extra arguments
 and flags without a value are errors. Settings in DB: `history.enabled`, `history.retention_days`.

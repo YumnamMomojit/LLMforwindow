@@ -1,7 +1,7 @@
 # Sharing over the internet
 
 Default: **Local only**. Nothing is published unless you pass `--share --cloudflared EXE --hostname H --i-authorize-public-sharing`.
-The Hub never opens router ports, uses UPnP, or touches Windows Firewall.
+Semdok Edge never opens router ports, uses UPnP, or touches Windows Firewall.
 
 | Address | Reachable from |
 |---|---|
@@ -12,15 +12,15 @@ The Hub never opens router ports, uses UPnP, or touches Windows Firewall.
 ## Chosen deployment path: named Cloudflare Tunnel (remotely managed) — NOT live-tested
 1. Own a domain on Cloudflare; create a named tunnel in Zero Trust → Networks → Tunnels; add a public hostname
    `api.example.com` → service `http://127.0.0.1:8787`; copy the tunnel token.
-2. `hubd secret set tunnel_token`, then paste the token at the prompt: typing is not echoed, so it stays off the screen and out of the
-   scrollback (Ctrl-C cancels and stores nothing). It also reads a pipe (`hubd secret set tunnel_token < token.txt`); avoid
-   `echo <token> | ...`, which leaves the token in the shell history. An empty token is refused. Install `cloudflared` yourself (the Hub
+2. `semdok-edge secret set tunnel_token`, then paste the token at the prompt: typing is not echoed, so it stays off the screen and out of the
+   scrollback (Ctrl-C cancels and stores nothing). It also reads a pipe (`semdok-edge secret set tunnel_token < token.txt`); avoid
+   `echo <token> | ...`, which leaves the token in the shell history. An empty token is refused. Install `cloudflared` yourself (Semdok Edge
    does not download it).
-3. `hubd serve --model ID --colibri-dir C --share --cloudflared C:\path\cloudflared.exe --hostname api.example.com --i-authorize-public-sharing`.
-   The token and the cloudflared path are checked before the model loads. hubd then prints the sharing state as it changes:
+3. `semdok-edge serve --model ID --colibri-dir C --share --cloudflared C:\path\cloudflared.exe --hostname api.example.com --i-authorize-public-sharing`.
+   The token and the cloudflared path are checked before the model loads. semdok-edge then prints the sharing state as it changes:
    `sharing: CONNECTING`, `CONNECTED` once cloudflared logs a registered connection, or `FAILED` (nothing is published, the local API keeps
    running); a warning follows if it is still not connected after 60 s. cloudflared's own log is not shown yet.
-4. From another network: `python scripts/verify_remote.py --base-url https://api.example.com/v1 --api-key lah_... --model ID --from-separate-network`
+4. From another network: `python scripts/verify_remote.py --base-url https://api.example.com/v1 --api-key sem_... --model ID --from-separate-network`
 5. Stop Sharing = stop the tunnel process (Ctrl-C ends everything today; a separate Stop button comes with the UI; `CloudflaredTunnel::stop`
    is meant to leave engine+gateway running — not exercised by any test).
 
@@ -31,10 +31,10 @@ Facts to check before relying on it (I could not read Cloudflare's docs directly
   >100 s prefill will fail via Cloudflare → use `stream:true` for long prompts. Whether comments keep a *tunnel* connection alive was not tested.
 * The gateway closes every connection after its response (no HTTP keep-alive), so cloudflared opens a new local connection per request
   and never reuses one the gateway is closing (a POST lost that way would not be retried).
-* Upload size limits (plans differ) are far above the Hub's 1 MiB body cap.
-* Quick Tunnels (`trycloudflare.com`) are random, ephemeral, and documented as not for production; the Hub does not use them.
+* Upload size limits (plans differ) are far above Semdok Edge's 1 MiB body cap.
+* Quick Tunnels (`trycloudflare.com`) are random, ephemeral, and documented as not for production; Semdok Edge does not use them.
 * Cloudflare terminates TLS and can see prompts and outputs. "Local inference" does not mean data never leaves the machine when shared.
 * cloudflared flags `tunnel --no-autoupdate run` + env `TUNNEL_TOKEN` were written from memory of the CLI, **unverified**; connection state is
   inferred from the log line "Registered tunnel connection".
-* The host must stay powered on, awake, online and running `hubd`; sharing ends when it stops. No Windows service is installed.
+* The host must stay powered on, awake, online and running `semdok-edge`; sharing ends when it stops. No Windows service is installed.
 * Alternative (replaceable): any reverse proxy / tunnel that forwards HTTPS to `127.0.0.1:8787`, with SSE buffering disabled.

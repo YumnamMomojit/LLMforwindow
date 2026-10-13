@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the downloadable Local AI Hub bundles from a Linux host:
-#   dist/LocalAIHub-<ver>-windows-x64.zip   (cross-compiled hubd.exe + hub.cmd)
-#   dist/LocalAIHub-<ver>-linux-x64.tar.gz  (hubd)
+# Build the downloadable Semdok Edge bundles from a Linux host:
+#   dist/SemdokEdge-<ver>-windows-x64.zip   (cross-compiled semdok-edge.exe + semdok.cmd)
+#   dist/SemdokEdge-<ver>-linux-x64.tar.gz  (semdok-edge)
 # Needs: rustup target x86_64-pc-windows-gnu, x86_64-w64-mingw32-gcc, cargo-about (--features cli).
 # The Colibri engine and Python are NOT bundled: the user adds the official release (README-FIRST.txt).
 # Reproducible: the same commit and toolchain (rustc, mingw-w64) give the same archives, whatever the checkout
@@ -9,7 +9,7 @@
 # checkout, target, cargo and rustup paths are remapped out of the binaries; the Windows linker writes no
 # timestamp and the symbol table is stripped (it carries rustc temp-dir names); archive entries have fixed
 # order, owners, modes and times.
-# hubd is always relinked here and copied from the path cargo reports for this very build, so a binary left
+# semdok-edge is always relinked here and copied from the path cargo reports for this very build, so a binary left
 # over from an earlier build (another CARGO_TARGET_DIR or build.target-dir) is never shipped.
 set -euo pipefail
 export LC_ALL=C TZ=UTC
@@ -32,19 +32,19 @@ TARGET_DIR=$(cargo metadata --format-version 1 --no-deps --locked | python3 -I -
 # that paths with spaces survive. With several matching prefixes rustc uses the last one: the target
 # directory, often inside the checkout, comes last.
 flags() { local IFS=$'\x1f'; echo "$*"; }
-REMAP=("--remap-path-prefix=$ROOT=/build/local-ai-hub"
+REMAP=("--remap-path-prefix=$ROOT=/build/semdok-edge"
        "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
        "--remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
        "--remap-path-prefix=$TARGET_DIR=/target")
 
-# build <triple> <rustflags...>: relink hubd for <triple> and set EXE to the executable cargo reports.
+# build <triple> <rustflags...>: relink semdok-edge for <triple> and set EXE to the executable cargo reports.
 build() {
   local triple=$1; shift
   local rf; rf="$(flags "$@")"
-  # Only hubd's own artifacts: the dependencies stay cached, but hubd is compiled and linked again.
-  cargo clean --release -p hubd --target "$triple" --quiet
+  # Only semdok-edge's own artifacts: the dependencies stay cached, but semdok-edge is compiled and linked again.
+  cargo clean --release -p semdok-edge --target "$triple" --quiet
   : > "$TMP/stamp"
-  CARGO_ENCODED_RUSTFLAGS="$rf" cargo build --release --locked -p hubd --target "$triple" \
+  CARGO_ENCODED_RUSTFLAGS="$rf" cargo build --release --locked -p semdok-edge --target "$triple" \
     --message-format=json-render-diagnostics > "$TMP/cargo.json"
   EXE=$(python3 -I - "$TMP/cargo.json" <<'PY'
 import json, sys
@@ -55,22 +55,22 @@ for line in open(sys.argv[1], encoding="utf-8"):
     except ValueError:
         continue
     t = m.get("target") or {}
-    if m.get("reason") == "compiler-artifact" and t.get("name") == "hubd" and "bin" in t.get("kind", ()) \
+    if m.get("reason") == "compiler-artifact" and t.get("name") == "semdok-edge" and "bin" in t.get("kind", ()) \
             and m.get("executable"):
         found.append((m["executable"], m.get("fresh")))
 if len(found) != 1 or found[0][1] is not False:
-    sys.exit(f"cargo did not report one freshly built hubd executable: {found}")
+    sys.exit(f"cargo did not report one freshly built semdok-edge executable: {found}")
 print(found[0][0])
 PY
 )
   [ -f "$EXE" ] && [ "$EXE" -nt "$TMP/stamp" ] || { echo "$EXE is missing or older than this build"; exit 1; }
 }
 build "$WIN" "${REMAP[@]}" -C link-arg=-Wl,--no-insert-timestamp -C strip=symbols
-WIN_EXE="$TMP/hubd.exe"; cp "$EXE" "$WIN_EXE"
+WIN_EXE="$TMP/semdok-edge.exe"; cp "$EXE" "$WIN_EXE"
 build "$LINUX" "${REMAP[@]}"
-LINUX_EXE="$TMP/hubd"; cp "$EXE" "$LINUX_EXE"
+LINUX_EXE="$TMP/semdok-edge"; cp "$EXE" "$LINUX_EXE"
 rm -rf "$OUT"; mkdir -p "$OUT"
-cargo about generate --locked -c packaging/about.toml -m crates/hubd/Cargo.toml packaging/about.hbs -o "$TMP/THIRD-PARTY-LICENSES.txt"
+cargo about generate --locked -c packaging/about.toml -m crates/semdok-edge/Cargo.toml packaging/about.hbs -o "$TMP/THIRD-PARTY-LICENSES.txt"
 
 crlf() { sed 's/\r$//; s/$/\r/' "$1" > "$2"; }   # Notepad-friendly text in the Windows bundle
 stage() { # stage <dir> <os>
@@ -81,19 +81,19 @@ stage() { # stage <dir> <os>
   cp docs/*.md "$d/docs/"
   cp LICENSE NOTICE "$d/"
   if [ "$os" = windows ]; then
-    cp "$WIN_EXE" "$d/hubd.exe"
-    crlf packaging/hub.cmd "$d/hub.cmd"   # cmd.exe misreads labels in LF-only batch files
+    cp "$WIN_EXE" "$d/semdok-edge.exe"
+    crlf packaging/semdok.cmd "$d/semdok.cmd"   # cmd.exe misreads labels in LF-only batch files
     crlf packaging/README-FIRST.txt "$d/README-FIRST.txt"
     crlf "$TMP/THIRD-PARTY-LICENSES.txt" "$d/THIRD-PARTY-LICENSES.txt"
     printf 'Unzip the official Colibri v2.0.0 Windows release here (see README-FIRST.txt, step 2).\r\n' > "$d/colibri/PUT-COLIBRI-HERE.txt"
   else
-    cp "$LINUX_EXE" "$d/hubd"
+    cp "$LINUX_EXE" "$d/semdok-edge"
     cp "$TMP/THIRD-PARTY-LICENSES.txt" "$d/"
-    printf 'Put a Colibri v2.0.0 checkout or release here, then: ./hubd ... --colibri-dir colibri (see docs/WINDOWS.md and README.md).\n' > "$d/colibri/PUT-COLIBRI-HERE.txt"
+    printf 'Put a Colibri v2.0.0 checkout or release here, then: ./semdok-edge ... --colibri-dir colibri (see docs/WINDOWS.md and README.md).\n' > "$d/colibri/PUT-COLIBRI-HERE.txt"
     cp README.md "$d/"
   fi
   {
-    echo "Local AI Hub $VER ($os x64)"
+    echo "Semdok Edge $VER ($os x64)"
     echo "source commit: $(git rev-parse HEAD)"
     echo "source date: $(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ); built with $(rustc --version)"
     echo "target: $([ "$os" = windows ] && echo "$WIN" || echo "$LINUX")"
@@ -103,7 +103,7 @@ stage() { # stage <dir> <os>
   (cd "$d" && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum | sed 's#  \./#  #') \
     | { if [ "$os" = windows ]; then sed 's/$/\r/'; else cat; fi; } > "$d/SHA256SUMS.txt"
 }
-W="LocalAIHub-$VER-windows-x64"; L="LocalAIHub-$VER-linux-x64"
+W="SemdokEdge-$VER-windows-x64"; L="SemdokEdge-$VER-linux-x64"
 stage "$TMP/$W" windows
 stage "$TMP/$L" linux
 # Deterministic order, times and modes; the zip keeps one top-level folder.
