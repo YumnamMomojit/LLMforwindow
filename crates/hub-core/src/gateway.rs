@@ -17,16 +17,16 @@ use hyper_util::service::TowerToHyperService;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,12 +39,15 @@ pub struct GatewayConfig {
     pub model_id: String,
     pub db_path: PathBuf,
     pub max_body_bytes: usize,
-    /// Max time to receive a whole request head, counted from when the connection opens or
-    /// goes idle after a response. Closes silent, trickling and idle keep-alive connections.
+    /// Max time to receive a whole request head, counted from when the connection opens.
+    /// Closes silent and trickling connections. A connection carries one request (keep-alive
+    /// is off), so none sits idle between requests.
     pub header_read_timeout_secs: u64,
     /// Max time to receive the request body once headers are in (trickling clients).
     pub body_read_timeout_secs: u64,
-    /// Client connections open at once; connections beyond this are closed on accept.
+    /// Client connections open at once. When all are open, a new connection takes the place
+    /// of the oldest one that has not sent its request head yet; only when every place is
+    /// serving a request is the new connection closed on accept.
     pub max_connections: usize,
     /// A response write blocked this long (the client stopped reading) closes the connection.
     /// Keep it above `stream_idle_timeout_secs` so streams give up on such a client first.
@@ -63,7 +66,10 @@ pub struct GatewayConfig {
     pub first_byte_timeout_secs: u64,
     /// SSE comment cadence while waiting for first byte (proxies with ~100 s limits).
     pub keepalive_secs: u64,
+    /// Upper bound for a request's `max_tokens` / `max_completion_tokens`.
     pub max_output_tokens: u32,
+    /// Used when a request sets neither. Generous on purpose: a reply cut at this length
+    /// looks finished to a client that ignores `finish_reason`.
     pub default_output_tokens: u32,
     pub rate_limit_per_min: u32,
     /// If non-empty, the Host header (without port) must match one of these.
@@ -91,8 +97,8 @@ impl Default for GatewayConfig {
             stream_idle_timeout_secs: 120,
             first_byte_timeout_secs: 600,
             keepalive_secs: 15,
-            max_output_tokens: 1024,
-            default_output_tokens: 256,
+            max_output_tokens: 4096,
+            default_output_tokens: 1024,
             rate_limit_per_min: 30,
             allowed_hosts: vec![],
         }
@@ -280,6 +286,13 @@ impl Inner {
 
 /// Accept loop for the public listener. `axum::serve` gives hyper no timer, which silently
 /// switches hyper's header-read timeout off, and it has no connection limit; this has both.
+///
+/// Keep-alive is off: every response carries `Connection: close` and the connection closes
+/// once the response is sent. A pooling client (cloudflared, reqwest: ~90 s idle pools) could
+/// otherwise reuse a connection at the moment the server times it out, and a POST lost that
+/// way is not retried. It also means a client holds a place only while its one request is
+/// read and answered; see `Place` for connections that never send a request.
+///
 /// On stop it closes the listener and lets open connections finish, as `axum::serve` did.
 async fn serve(
     listener: tokio::net::TcpListener,
@@ -291,13 +304,16 @@ async fn serve(
     // panics, either of which would kill this task and leave the gateway deaf.
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new())
+        .keep_alive(false)
         .header_read_timeout(Duration::from_secs(
             cfg.header_read_timeout_secs.clamp(1, 86_400),
         ));
     let write_stall = Duration::from_secs(cfg.write_stall_timeout_secs.max(1));
-    let places = Arc::new(Semaphore::new(
-        cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS),
-    ));
+    let cap = cfg.max_connections.clamp(1, Semaphore::MAX_PERMITS);
+    let places = Arc::new(Semaphore::new(cap));
+    // Connections that may still be waiting for their request head, oldest first. Entries
+    // for connections past that point are skipped when met and pruned in bulk below.
+    let mut heads: VecDeque<Weak<Place>> = VecDeque::new();
     let graceful = GracefulShutdown::new();
     loop {
         let accepted = tokio::select! {
@@ -321,20 +337,115 @@ async fn serve(
                 continue;
             }
         };
-        // Over the cap: close the new connection at once rather than let connections pile up.
-        let Ok(place) = places.clone().try_acquire_owned() else {
-            tracing::debug!("gateway connection limit reached; closing a new connection");
-            continue;
+        // Over the cap, a connection still waiting for its request head gives up its place.
+        // Only if every place is serving a request is the new connection closed at once.
+        let permit = match places.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => match evict_oldest(&mut heads) {
+                Some(p) => p,
+                None => {
+                    tracing::debug!("gateway connection limit reached; closing a new connection");
+                    continue;
+                }
+            },
         };
+        let place = Arc::new(Place::new(permit));
+        // Live entries hold a permit each, so pruning when the queue is twice the open
+        // connections bounds it at amortised O(1) per accept.
+        if heads.len() > 2 * (cap - places.available_permits()) + 16 {
+            heads.retain(|w| w.upgrade().is_some_and(|p| p.evictable()));
+        }
+        heads.push_back(Arc::downgrade(&place));
         let io = TokioIo::new(WriteStall::new(tcp, write_stall));
-        let conn = graceful.watch(http.serve_connection(io, TowerToHyperService::new(app.clone())));
+        let app = TowerToHyperService::new(app.clone());
+        let seen = place.clone();
+        let svc = hyper::service::service_fn(move |req| {
+            let admitted = seen.head_in();
+            let res = hyper::service::Service::call(&app, req);
+            async move {
+                if !admitted {
+                    // Evicted just before its head was in: the task below drops the connection.
+                    std::future::pending::<()>().await;
+                }
+                res.await
+            }
+        });
+        let conn = graceful.watch(http.serve_connection(io, svc));
         tokio::spawn(async move {
-            let _ = conn.await;
-            drop(place);
+            tokio::select! {
+                _ = conn => {}
+                _ = place.evicted.notified() => {}
+            }
+            // `place` drops here and frees its permit, unless a newer connection took it.
         });
     }
     drop(listener);
     graceful.shutdown().await;
+}
+
+/// A connection's place under `max_connections`. Until its request head is in, a newer
+/// connection may take the place over when none is free (`evict_oldest`), so clients that
+/// connect and send nothing, which needs no key, cannot lock out clients that send requests.
+/// Once the head is in, the place is kept until the connection closes; with keep-alive off
+/// that is when its one request has been answered (or given up on, see `WriteStall`).
+struct Place {
+    state: Mutex<PlaceState>,
+    /// Notified when a newer connection takes the place over; this one then closes.
+    evicted: Notify,
+}
+
+struct PlaceState {
+    /// `None` once a newer connection has taken it.
+    permit: Option<OwnedSemaphorePermit>,
+    head_in: bool,
+}
+
+impl Place {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            state: Mutex::new(PlaceState {
+                permit: Some(permit),
+                head_in: false,
+            }),
+            evicted: Notify::new(),
+        }
+    }
+
+    /// Records that the request head is in. False if the place was taken over first.
+    fn head_in(&self) -> bool {
+        let mut s = self.state.lock().unwrap();
+        s.head_in = s.permit.is_some();
+        s.head_in
+    }
+
+    fn evictable(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.permit.is_some() && !s.head_in
+    }
+
+    /// Takes the permit and tells the connection to close, if its head is not in yet.
+    fn evict(&self) -> Option<OwnedSemaphorePermit> {
+        let mut s = self.state.lock().unwrap();
+        if s.head_in {
+            return None;
+        }
+        let permit = s.permit.take()?;
+        self.evicted.notify_one();
+        Some(permit)
+    }
+}
+
+/// The permit of the oldest connection still waiting for its request head, which is closed.
+/// Oldest first, so a client that has just connected and is sending its request is the last
+/// to go: crowding it out takes a new connection for every place within that short time.
+fn evict_oldest(heads: &mut VecDeque<Weak<Place>>) -> Option<OwnedSemaphorePermit> {
+    while let Some(w) = heads.pop_front() {
+        if let Some(permit) = w.upgrade().and_then(|p| p.evict()) {
+            tracing::debug!("gateway connection limit reached; closing the oldest idle connection");
+            return Some(permit);
+        }
+    }
+    None
 }
 
 /// A client socket whose writes fail once they have been blocked for `limit` because the

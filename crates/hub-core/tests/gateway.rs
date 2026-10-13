@@ -13,7 +13,7 @@ use hub_core::gateway::{Gateway, GatewayConfig};
 use hub_core::{db, keys};
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering::SeqCst},
+    atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -745,6 +745,22 @@ async fn read_until_closed(
     }
 }
 
+/// Reads for `dur`, or until the server closes the connection first. Returns what arrived
+/// and whether the server closed the connection.
+async fn read_for(s: &mut (impl tokio::io::AsyncRead + Unpin), dur: Duration) -> (Vec<u8>, bool) {
+    use tokio::io::AsyncReadExt;
+    let end = tokio::time::Instant::now() + dur;
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        match tokio::time::timeout_at(end, s.read(&mut buf)).await {
+            Err(_) => return (got, false),
+            Ok(Ok(0)) | Ok(Err(_)) => return (got, true),
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
 /// A raw client with a tiny receive buffer that starts an endless stream and never reads.
 async fn stalled_flood_client(e: &Env) -> tokio::net::TcpStream {
     use tokio::io::AsyncWriteExt;
@@ -805,7 +821,7 @@ async fn silent_trickling_and_idle_connections_are_closed() {
     assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
     assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
     trickle.abort();
-    // a keep-alive connection that goes idle after a response is closed as well
+    // no connection is left idle after a response: it closes as soon as the response is sent
     let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
     s.write_all(
         format!(
@@ -820,8 +836,13 @@ async fn silent_trickling_and_idle_connections_are_closed() {
     let (got, closed) = read_until_closed(&mut s, Duration::from_secs(5)).await;
     let got = String::from_utf8_lossy(&got);
     assert!(got.starts_with("HTTP/1.1 200"), "{got}");
-    assert!(closed, "an idle keep-alive connection stayed open");
-    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    assert!(got.contains("\r\nconnection: close\r\n"), "{got}");
+    assert!(closed, "the connection stayed open after its response");
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
     // the timeout covers request heads only: a stream outliving it is not cut
     let text = post_chat(&e, &chat("hold", true))
         .await
@@ -833,11 +854,28 @@ async fn silent_trickling_and_idle_connections_are_closed() {
     assert_eq!(post_chat(&e, &chat("hi", false)).await.status(), 200);
 }
 
+/// A raw client that sends a whole streaming request for `msg` and never reads the reply.
+async fn raw_stream_request(e: &Env, msg: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let body = chat(msg, true).to_string();
+    let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    s.write_all(format!("{}{body}", raw_head(e, body.len())).as_bytes())
+        .await
+        .unwrap();
+    s
+}
+
 #[tokio::test]
 async fn connections_over_the_cap_are_closed_at_once() {
-    let e = setup(|c| c.max_connections = 2).await;
-    let a = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
-    let b = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let e = setup(|c| {
+        c.max_connections = 2;
+        c.max_active = 2;
+    })
+    .await;
+    // both places serve a request (a long stream each), so neither can be taken over
+    let a = raw_stream_request(&e, "drip").await;
+    let b = raw_stream_request(&e, "drip").await;
+    assert!(eventually(|| e.gw.snapshot().active == 2, 2).await);
     let mut over = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
     let t0 = Instant::now();
     let (got, closed) = read_until_closed(&mut over, Duration::from_secs(5)).await;
@@ -855,6 +893,113 @@ async fn connections_over_the_cap_are_closed_at_once() {
     }
     assert!(served, "the freed place was never reused");
     drop(b);
+}
+
+#[tokio::test]
+async fn a_connection_that_sends_no_request_gives_its_place_to_a_new_one() {
+    let e = setup(|c| {
+        c.max_connections = 2;
+        c.max_active = 2;
+    })
+    .await;
+    // the oldest place: connected, never sends a byte, no key
+    let mut silent = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // the other place serves a request
+    let mut busy = raw_stream_request(&e, "drip").await;
+    assert!(eventually(|| e.gw.snapshot().active == 1, 2).await);
+    // full, yet a key holder is served: the silent connection makes room
+    let t0 = Instant::now();
+    assert!(models_ok(&e).await, "a silent connection kept its place");
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    let (got, closed) = read_until_closed(&mut silent, Duration::from_secs(2)).await;
+    assert!(
+        closed && got.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&got)
+    );
+    // the connection serving a request is never the one to go, however old
+    for _ in 0..3 {
+        let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(models_ok(&e).await);
+        let (_, closed) = read_until_closed(&mut s, Duration::from_secs(2)).await;
+        assert!(closed, "the newer silent connection was kept");
+    }
+    let (got, closed) = read_for(&mut busy, Duration::from_millis(800)).await;
+    assert!(!closed, "the connection serving a stream was closed");
+    let got = String::from_utf8_lossy(&got);
+    assert!(
+        got.starts_with("HTTP/1.1 200") && got.contains("drip#"),
+        "{got}"
+    );
+    assert_eq!(e.gw.snapshot().active, 1);
+}
+
+/// The lockout from the review: clients without a key fill every place, either connecting
+/// and sending nothing or sending keyless requests (which used to keep a keep-alive
+/// connection, and its place, for good), and reconnect whenever they are closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyless_clients_cannot_lock_out_a_key_holder() {
+    use tokio::io::AsyncWriteExt;
+    let e = setup(|c| {
+        c.max_connections = 16;
+        c.header_read_timeout_secs = 2;
+    })
+    .await;
+    let addr = e.gw.addr;
+    let stop = Arc::new(AtomicBool::new(false));
+    let keyless_401s = Arc::new(AtomicUsize::new(0));
+    let mut crowd = vec![];
+    for i in 0..32 {
+        let (stop, n401) = (stop.clone(), keyless_401s.clone());
+        crowd.push(tokio::spawn(async move {
+            while !stop.load(SeqCst) {
+                if let Ok(mut s) = tokio::net::TcpStream::connect(addr).await {
+                    if i % 2 == 0 {
+                        let _ = read_until_closed(&mut s, Duration::from_secs(60)).await;
+                    } else {
+                        // asks again before the header timeout for as long as it may
+                        loop {
+                            let req = b"GET /v1/models HTTP/1.1\r\nhost: localhost\r\n\r\n";
+                            if s.write_all(req).await.is_err() {
+                                break;
+                            }
+                            let (got, closed) =
+                                read_until_closed(&mut s, Duration::from_millis(500)).await;
+                            if got.starts_with(b"HTTP/1.1 401") {
+                                n401.fetch_add(1, SeqCst);
+                            }
+                            if closed {
+                                break;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut served = 0;
+    for _ in 0..20 {
+        if models_ok(&e).await {
+            served += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop.store(true, SeqCst);
+    for t in crowd {
+        t.abort();
+    }
+    assert!(
+        keyless_401s.load(SeqCst) > 20,
+        "the keyless clients were not running"
+    );
+    assert!(
+        served >= 19,
+        "the key holder was served {served} of 20 times"
+    );
 }
 
 #[tokio::test]
@@ -937,6 +1082,165 @@ fn connection_limits_have_serde_defaults() {
     assert_eq!(c.max_connections, 256);
     assert_eq!(c.write_stall_timeout_secs, 180);
     assert!(c.write_stall_timeout_secs > c.stream_idle_timeout_secs);
+    assert_eq!((c.default_output_tokens, c.max_output_tokens), (1024, 4096));
+}
+
+/// A request without max_tokens (what `hubd chat` sends) gets 1024 tokens, not 256, and a
+/// client may ask for up to 4096.
+#[test]
+fn output_token_defaults_leave_room_for_a_full_reply() {
+    let cfg = GatewayConfig {
+        model_id: "test-model".into(),
+        ..Default::default()
+    };
+    let max_tokens = |extra: Value| {
+        let mut b = chat("hi", true);
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (up, _) = hub_core::gateway::sanitize_chat_request(b, &cfg).unwrap();
+        up["max_tokens"].as_i64().unwrap()
+    };
+    assert_eq!(max_tokens(json!({})), 1024);
+    assert_eq!(max_tokens(json!({"max_tokens": null})), 1024);
+    assert_eq!(max_tokens(json!({"max_tokens": 3000})), 3000);
+    assert_eq!(max_tokens(json!({"max_completion_tokens": 99999})), 4096);
+}
+
+/// Every response says `Connection: close` and its connection closes once it is sent, so a
+/// pooling client (cloudflared, `hubd chat`) never reuses a connection the server is about
+/// to close; such a reused POST used to fail when it met the header timeout.
+#[tokio::test]
+async fn every_response_closes_its_connection() {
+    use tokio::io::AsyncWriteExt;
+    let e = setup(|_| {}).await;
+    let c = client();
+    let models = format!("{}/v1/models", e.base);
+    let chat_url = format!("{}/v1/chat/completions", e.base);
+    let responses = [
+        c.get(&models).bearer_auth(&e.token).send().await.unwrap(),
+        c.get(&models).send().await.unwrap(),
+        c.get(format!("{}/nope", e.base)).send().await.unwrap(),
+        post_chat(&e, &chat("hi", false)).await,
+        post_chat(&e, &chat("hi", true)).await,
+        c.post(&chat_url)
+            .json(&chat("hi", false))
+            .send()
+            .await
+            .unwrap(),
+    ];
+    let statuses: Vec<u16> = responses.iter().map(|r| r.status().as_u16()).collect();
+    assert_eq!(statuses, [200, 401, 404, 200, 200, 401]);
+    for r in responses {
+        assert_eq!(r.headers()["connection"], "close", "{}", r.url());
+        r.bytes().await.unwrap();
+    }
+    // a second request on the same connection is not served: the connection closes first
+    let mut s = tokio::net::TcpStream::connect(e.gw.addr).await.unwrap();
+    let get = format!(
+        "GET /v1/models HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer {}\r\n\r\n",
+        e.token
+    );
+    s.write_all(format!("{get}{get}").as_bytes()).await.unwrap();
+    let (got, closed) = read_until_closed(&mut s, Duration::from_secs(5)).await;
+    let got = String::from_utf8_lossy(&got);
+    assert!(closed, "{got}");
+    assert_eq!(got.matches("HTTP/1.1 ").count(), 1, "{got}");
+    // a pooling client opens a new connection for every request
+    let (base, conns) = counting_relay(e.gw.addr).await;
+    let pooled = client();
+    for stream in [false, true, false] {
+        let r = pooled
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(&e.token)
+            .json(&chat("hi", stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        r.bytes().await.unwrap();
+    }
+    assert_eq!(conns.load(SeqCst), 3, "the client reused a connection");
+}
+
+/// A TCP relay to `target` that counts the connections made through it.
+async fn counting_relay(target: std::net::SocketAddr) -> (String, Arc<AtomicUsize>) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let conns = Arc::new(AtomicUsize::new(0));
+    let n = conns.clone();
+    tokio::spawn(async move {
+        while let Ok((mut a, _)) = l.accept().await {
+            n.fetch_add(1, SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut b) = tokio::net::TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                }
+            });
+        }
+    });
+    (base, conns)
+}
+
+/// The review's race: a pooling client sent its next POST just as the server closed the
+/// idle connection (header timeout, here 1 s) and lost it. Each trial sends a request, then
+/// the next one from the same client at a precise gap around that timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pooling_client_never_meets_a_closing_connection() {
+    let e = setup(|c| {
+        c.header_read_timeout_secs = 1;
+        // every trial's request runs at once, none is turned away for want of a slot
+        c.max_active = 32;
+        c.max_queue = 32;
+    })
+    .await;
+    let url = format!("{}/v1/chat/completions", e.base);
+    let trials: Vec<_> = (0..24u64)
+        .map(|i| {
+            let (url, token) = (url.clone(), e.token.clone());
+            // 997.0 ms to 1002.75 ms after the previous response
+            let gap = Duration::from_micros(997_000 + 250 * i);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let c = client();
+                    let send = || async {
+                        let r = c
+                            .post(&url)
+                            .bearer_auth(&token)
+                            .json(&chat("hi", false))
+                            .send()
+                            .await?;
+                        let st = r.status().as_u16();
+                        r.bytes().await?;
+                        Ok::<_, reqwest::Error>(st)
+                    };
+                    assert_eq!(send().await.unwrap(), 200);
+                    let t = Instant::now();
+                    while t.elapsed() + Duration::from_millis(3) < gap {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    while t.elapsed() < gap {
+                        std::hint::spin_loop();
+                    }
+                    (gap, send().await.map_err(|e| format!("{e:?}")))
+                })
+            })
+        })
+        .collect();
+    let results = tokio::task::spawn_blocking(move || {
+        trials
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
+    let failed: Vec<_> = results.iter().filter(|(_, r)| r != &Ok(200)).collect();
+    assert!(failed.is_empty(), "{failed:?}");
 }
 
 #[tokio::test]
