@@ -81,6 +81,15 @@ fn check_win32_name(c: &str) -> R<()> {
 /// not Unicode's uppercase: `ı`/`I`, `ſ`/`S`, `µ`/`Μ`, `ς`/`Σ`, `ǅ`/`Ǆ` and Georgian
 /// Mkhedruli/Mtavruli are distinct names on NTFS, `ᾳ`/`ᾼ` are one, and characters outside
 /// the BMP (surrogate pairs) are compared exactly. Maps character to character (length is kept).
+///
+/// Other volumes fold differently. exFAT's up-case table (the one Windows and mkfs.exfat
+/// write) leaves about a hundred characters alone that this table folds, which only makes the
+/// key stricter there, but it folds final `ς` to `Σ`, as do NTFS volumes formatted by XP or
+/// Vista and case-insensitive folders on Linux. Keying by such a table would merge names that
+/// are distinct on every NTFS volume formatted since 2009, so the key stays NTFS's and the
+/// volume itself is asked instead: [`check_stored_spelling`] refuses a name the volume merges
+/// with a stored name the key keeps apart (`ΛΟΓΟΣ.txt` while `λογος.txt` exists, on exFAT)
+/// rather than track one file under two rows.
 fn path_key(rel: &str) -> String {
     rel.chars()
         .map(|ch| match u16::try_from(u32::from(ch)) {
@@ -104,9 +113,11 @@ fn upcase(u: u16) -> u16 {
 /// The `$UpCase` table Windows 7 and later write when formatting NTFS (Windows 8's file has
 /// MD5 7ff498a44e45e77374cc7c962b1b92f2, as published by ntfs-3g; a unit test checks this
 /// table against it). Runs of `(first, last, first's uppercase, step)`, step 1 or 2 (every
-/// other unit: alternating capital/small pairs); every other unit maps to itself. Volumes formatted by XP or Vista keep their older table, which differs for 343
-/// characters (among them `ș`, `ț` and final `ς`). Those are not refused: that would refuse
-/// ordinary Romanian and Greek names on every volume to cover drives formatted before 2009.
+/// other unit: alternating capital/small pairs); every other unit maps to itself. Volumes
+/// formatted by XP or Vista keep their older table, which differs for 343 characters (among
+/// them `ș`, `ț` and final `ς`). Those are not refused up front: that would refuse ordinary
+/// Romanian and Greek names on every volume to cover drives formatted before 2009. Where such
+/// a volume merges names this table keeps apart, [`check_stored_spelling`] notices.
 #[rustfmt::skip]
 const UPCASE: [(u16, u16, u16, u16); 134] = [
     (0x0061, 0x007A, 0x0041, 1), (0x00E0, 0x00F6, 0x00C0, 1), (0x00F8, 0x00FE, 0x00D8, 1), (0x00FF, 0x00FF, 0x0178, 1),
@@ -156,6 +167,45 @@ fn looks_like_short_name(c: &str) -> bool {
             .split('~')
             .skip(1)
             .any(|t| t.starts_with(|ch: char| ch.is_ascii_digit()))
+}
+
+/// Refuse `comps` under `dir` if a component the volume finds is stored there under a spelling
+/// [`path_key`] calls another name: the volume merges names the key keeps apart (see there).
+/// Through such a name an overwrite would replace a tracked file under a second row, and a new
+/// file would be tracked under a folder spelling that a lookup by the stored one never finds.
+/// For names no row matches; costs one directory listing per component that exists.
+fn check_stored_spelling(dir: &Path, comps: &[String]) -> R<()> {
+    let mut cur = dir.to_path_buf();
+    for (i, c) in comps.iter().enumerate() {
+        let next = cur.join(c);
+        match std::fs::symlink_metadata(&next) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        if !listed_alike(&cur, c)? {
+            return Err(StorageError::Exists(format!(
+                "a name this volume treats as {:?}",
+                comps[..=i].join("/")
+            )));
+        }
+        cur = next;
+    }
+    Ok(())
+}
+
+/// Whether `dir` lists an entry [`path_key`] considers the same name as `name`.
+fn listed_alike(dir: &Path, name: &str) -> std::io::Result<bool> {
+    let (key, len) = (path_key(name), name.chars().count());
+    for e in std::fs::read_dir(dir)? {
+        let n = e?.file_name();
+        if n.to_str()
+            .is_some_and(|n| n.chars().count() == len && path_key(n) == key)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn remove_if_exists(p: &Path) -> std::io::Result<()> {
@@ -224,8 +274,10 @@ const SNAPSHOT_PREFIX: &str = ".backup-snapshot-";
 const ABANDONED_SNAPSHOT: Duration = Duration::from_secs(3600);
 
 /// A replacement in flight. Written to `<ws>/.tmp-uploads/<id>.txn` before anything is
-/// renamed and removed once disk and database agree again; `<id>.new` is the upload and
-/// `<id>.old` the file it replaces, kept until the row is committed.
+/// renamed and removed once disk and database agree again; `<id>.new` is the upload. The file
+/// it replaces stays reachable until the row is committed: as `<id>.link`, a second hard link
+/// (its own name keeps it until the upload is renamed over that name, in one step), or, on a
+/// volume without hard links (FAT, exFAT, some network shares), moved aside to `<id>.old`.
 #[derive(Serialize, Deserialize)]
 struct Pending {
     rel_path: String,
@@ -250,6 +302,7 @@ fn settle(conn: &Connection, ws: &str, wdir: &Path, txn: &Path) -> R<()> {
     };
     let new = txn.with_extension("new");
     let old = txn.with_extension("old");
+    let link = txn.with_extension("link");
     let target = resolve_in(wdir, &sanitize_rel(&p.rel_path)?)?;
     let committed = conn
         .query_row(
@@ -259,20 +312,31 @@ fn settle(conn: &Connection, ws: &str, wdir: &Path, txn: &Path) -> R<()> {
         )
         .optional()?
         .unwrap_or(false);
+    // While the journal exists, `new` is gone only if it was renamed over `target`.
     let present = |f: &Path| std::fs::symlink_metadata(f).is_ok();
     if committed {
         if present(&new) {
             std::fs::rename(&new, &target)?;
         }
-        remove_if_exists(&old)?;
     } else if p.had_old {
         if present(&old) {
+            // Moved aside: put it back.
             std::fs::rename(&old, &target)?;
+        } else if present(&link) && !present(&new) {
+            // The upload replaced it: put it back, again in one step. While `new` is still
+            // there, `target` never stopped being the old file and `link` is a second name.
+            std::fs::rename(&link, &target)?;
         }
     } else if !present(&new) {
         // Nothing stood there before and the new file had been renamed in: remove it.
         remove_if_exists(&target)?;
     }
+    remove_if_exists(&old)?;
+    // By now `link` names nothing anyone needs (a file back on its own name, or one the row
+    // has moved on from). Windows refuses to remove it while a program holds that file open
+    // without delete sharing (the case where the upload's rename failed); it then waits for
+    // the next start-up's clean-up rather than fail every later write to the workspace.
+    let _ = std::fs::remove_file(&link);
     remove_if_exists(txn)?;
     remove_if_exists(&new)?;
     Ok(())
@@ -532,20 +596,25 @@ impl Workspaces {
         let mut comps = sanitize_rel(rel)?;
         let mut rel_norm = comps.join("/");
         let mut existing_size = 0;
-        if let Some((_, stored, size)) = self.find_file(ws, &rel_norm)? {
+        let tracked = self.find_file(ws, &rel_norm)?;
+        if let Some((_, stored, size)) = &tracked {
             if !overwrite {
-                return Err(StorageError::Exists(stored));
+                return Err(StorageError::Exists(stored.clone()));
             }
             // The same file under another spelling: keep the stored one, so row and disk stay 1:1.
-            comps = sanitize_rel(&stored)?;
-            rel_norm = stored;
-            existing_size = size;
+            comps = sanitize_rel(stored)?;
+            rel_norm = stored.clone();
+            existing_size = *size;
         }
         let final_path = resolve_in(&wdir, &comps)?;
-        // Never replace a file the database does not know about (a leftover, or an alias
-        // the key cannot see) unless asked to.
+        // Never replace a file the database does not know about (a leftover) unless asked to.
         if !overwrite && std::fs::symlink_metadata(&final_path).is_ok() {
             return Err(StorageError::Exists(rel_norm));
+        }
+        // Nor one the volume reaches through a spelling the key cannot see.
+        let untracked = tracked.is_none();
+        if untracked {
+            check_stored_spelling(&wdir, &comps)?;
         }
         if let Some(parent) = final_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -598,9 +667,10 @@ impl Workspaces {
         let created = now();
         let txn = tmpdir.join(format!("{id}.txn"));
         let old = tmpdir.join(format!("{id}.old"));
-        // Under the write lock: journal, row, renames, COMMIT. The replaced file is kept as
-        // `old` until the row is committed, so a failed COMMIT or a crash (see `settle`)
-        // never leaves the disk holding a file the row does not describe.
+        let link = tmpdir.join(format!("{id}.link"));
+        // Under the write lock: journal, row, renames, COMMIT. The replaced file stays
+        // reachable (see `Pending`) until the row is committed, so a failed COMMIT or a crash
+        // (see `settle`) never leaves the disk holding a file the row does not describe.
         let committed = (|| -> R<()> {
             let tx = self
                 .conn
@@ -614,6 +684,9 @@ impl Workspaces {
                 Err(e) if e.kind() == ErrorKind::NotFound => false,
                 Err(e) => return Err(e.into()),
             };
+            if untracked {
+                check_stored_spelling(&wdir, &comps)?;
+            }
             let pending = Pending {
                 rel_path: rel_norm.clone(),
                 sha256: sha.clone(),
@@ -630,7 +703,10 @@ impl Workspaces {
                 "INSERT INTO files(ws_id,rel_path,size,sha256,kind,created_at) VALUES(?1,?2,?3,?4,?5,?6)
                  ON CONFLICT(ws_id,rel_path) DO UPDATE SET size=?3,sha256=?4,kind=?5,created_at=?6",
                 params![ws, rel_norm, size as i64, sha, kind, created])?;
-            if had_old {
+            // A second link keeps the old file without taking it off its name, so the rename
+            // below replaces it in one step and a reader never finds the name missing. Without
+            // hard links it is moved aside, and the name is missing until that rename.
+            if had_old && std::fs::hard_link(&final_path, &link).is_err() {
                 std::fs::rename(&final_path, &old)?;
             }
             std::fs::rename(&tmp, &final_path)?;
@@ -646,6 +722,7 @@ impl Workspaces {
             return Err(e);
         }
         let _ = std::fs::remove_file(&old);
+        let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_file(&txn);
         Ok(FileRecord {
             rel_path: rel_norm,
@@ -902,10 +979,34 @@ mod tests {
         (d, w, id, wdir)
     }
 
+    /// How a write keeps the file it replaces until its row is committed.
+    #[derive(Clone, Copy, Debug)]
+    enum Keep {
+        /// A second hard link in the temp area; the file stays on its name.
+        Link,
+        /// Moved aside, on a volume without hard links.
+        Aside,
+    }
+
+    /// Every `(keep, renamed)` with `renamed` in `steps`.
+    fn cases(steps: std::ops::RangeInclusive<u8>) -> Vec<(Keep, u8)> {
+        [Keep::Link, Keep::Aside]
+            .into_iter()
+            .flat_map(|k| steps.clone().map(move |r| (k, r)))
+            .collect()
+    }
+
     /// What a write of `content` to `rel` leaves if the process dies after `renamed` of its
-    /// renames (0: none, 1: the old file moved aside, 2: the new one in place too), with its
-    /// row `committed` or not.
-    fn crash(w: &Workspaces, ws: &str, rel: &str, content: &[u8], renamed: u8, committed: bool) {
+    /// steps (0: none, 1: the old file kept as `keep` says, 2: the new one renamed into place
+    /// too), with its row `committed` or not.
+    fn crash(
+        w: &Workspaces,
+        ws: &str,
+        rel: &str,
+        content: &[u8],
+        (keep, renamed): (Keep, u8),
+        committed: bool,
+    ) {
         let wdir = w.root.join(ws);
         let tmp = wdir.join(".tmp-uploads");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -920,7 +1021,10 @@ mod tests {
         std::fs::write(tmp.join("c.txn"), serde_json::to_vec(&p).unwrap()).unwrap();
         std::fs::write(tmp.join("c.new"), content).unwrap();
         if renamed >= 1 && p.had_old {
-            std::fs::rename(&target, tmp.join("c.old")).unwrap();
+            match keep {
+                Keep::Link => std::fs::hard_link(&target, tmp.join("c.link")).unwrap(),
+                Keep::Aside => std::fs::rename(&target, tmp.join("c.old")).unwrap(),
+            }
         }
         if renamed >= 2 {
             std::fs::rename(tmp.join("c.new"), &target).unwrap();
@@ -938,15 +1042,15 @@ mod tests {
 
     #[test]
     fn startup_puts_back_what_an_uncommitted_write_replaced() {
-        for renamed in 0..=2 {
+        for case in cases(0..=2) {
             let (d, w, id, wdir) = setup();
-            crash(&w, &id, "f.txt", b"brand new", renamed, false);
+            crash(&w, &id, "f.txt", b"brand new", case, false);
             drop(w);
             let w = open(d.path());
             assert_eq!(
                 std::fs::read(wdir.join("f.txt")).unwrap(),
                 b"old",
-                "{renamed}"
+                "{case:?}"
             );
             let i = w.info(&id).unwrap();
             assert_eq!((i.files, i.used_bytes), (1, 3));
@@ -957,12 +1061,16 @@ mod tests {
     #[test]
     fn startup_keeps_what_a_committed_write_put_in_place() {
         // renamed = 1: the COMMIT reached the disk but the second rename did not
-        for renamed in 1..=2 {
+        for case in cases(1..=2) {
             let (d, w, id, wdir) = setup();
-            crash(&w, &id, "f.txt", b"brand new", renamed, true);
+            crash(&w, &id, "f.txt", b"brand new", case, true);
             drop(w);
             let w = open(d.path());
-            assert_eq!(std::fs::read(wdir.join("f.txt")).unwrap(), b"brand new");
+            assert_eq!(
+                std::fs::read(wdir.join("f.txt")).unwrap(),
+                b"brand new",
+                "{case:?}"
+            );
             assert_eq!(w.info(&id).unwrap().used_bytes, 9);
             assert!(!wdir.join(".tmp-uploads").exists());
         }
@@ -971,7 +1079,7 @@ mod tests {
     #[test]
     fn startup_removes_a_new_file_whose_row_never_committed() {
         let (d, w, id, wdir) = setup();
-        crash(&w, &id, "n.txt", b"x", 2, false);
+        crash(&w, &id, "n.txt", b"x", (Keep::Link, 2), false);
         drop(w);
         let w = open(d.path());
         assert!(!wdir.join("n.txt").exists());
@@ -994,23 +1102,68 @@ mod tests {
     /// A long-lived instance never restarts: its next write settles first.
     #[test]
     fn the_next_write_settles_a_crashed_one_first() {
-        let (_d, mut w, id, wdir) = setup();
-        crash(&w, &id, "f.txt", b"brand new", 2, false);
-        w.write_file(
-            &id,
-            "g.txt",
-            &mut Cursor::new(b"g".to_vec()),
-            "import",
-            false,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(wdir.join("f.txt")).unwrap(), b"old");
-        assert_eq!(
-            std::fs::read_dir(wdir.join(".tmp-uploads"))
-                .unwrap()
-                .count(),
-            0
-        );
+        for case in cases(1..=2) {
+            let (_d, mut w, id, wdir) = setup();
+            crash(&w, &id, "f.txt", b"brand new", case, false);
+            w.write_file(
+                &id,
+                "g.txt",
+                &mut Cursor::new(b"g".to_vec()),
+                "import",
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(wdir.join("f.txt")).unwrap(),
+                b"old",
+                "{case:?}"
+            );
+            assert_eq!(
+                std::fs::read_dir(wdir.join(".tmp-uploads"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    /// While the upload is still pending, a linked file never left its name: settling only
+    /// drops the second name, so the file there is the very same one, not a copy put back.
+    #[cfg(unix)]
+    #[test]
+    fn settling_a_pending_upload_leaves_a_linked_file_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let (d, w, id, wdir) = setup();
+        let ino = std::fs::metadata(wdir.join("f.txt")).unwrap().ino();
+        crash(&w, &id, "f.txt", b"brand new", (Keep::Link, 1), false);
+        drop(w);
+        drop(open(d.path()));
+        let m = std::fs::metadata(wdir.join("f.txt")).unwrap();
+        assert_eq!((m.ino(), m.nlink()), (ino, 1));
+    }
+
+    /// Which names are one is the volume's call. A test volume that keeps every spelling
+    /// apart never merges two, so the comparison with the listing is checked directly here.
+    #[test]
+    fn a_stored_spelling_must_be_one_the_key_calls_the_same_name() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("Dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("λογος.txt"), "x").unwrap();
+        // what exFAT opens for `ΛΟΓΟΣ.txt` is stored as a name the key calls another one
+        assert!(!listed_alike(&dir, "ΛΟΓΟΣ.txt").unwrap());
+        assert!(listed_alike(&dir, "ΛΟΓΟς.TXT").unwrap());
+        assert!(listed_alike(d.path(), "dIR").unwrap());
+        assert!(!listed_alike(d.path(), "Dir2").unwrap());
+        // every existing component is listed alike; the first missing one ends the walk
+        for ok in [
+            "Dir/λογος.txt",
+            "Dir/new.txt",
+            "Dir/new/deeper.txt",
+            "x/y.txt",
+        ] {
+            check_stored_spelling(d.path(), &sanitize_rel(ok).unwrap()).unwrap();
+        }
     }
 
     #[test]
