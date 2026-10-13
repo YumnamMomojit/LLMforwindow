@@ -22,7 +22,7 @@ jobs:
       - run: |
           git clone --depth 1 --branch v2.0.0 https://github.com/JustVugg/colibri "$RUNNER_TEMP/colibri"
           test "$(git -C $RUNNER_TEMP/colibri rev-parse HEAD)" = "bf2442915d6e3dd4cdfd2eb9c2a3d2aa44a25850"
-          COLIBRI_DIR=$RUNNER_TEMP/colibri scripts/e2e_real_fixture.sh
+          COLIBRI_DIR=$RUNNER_TEMP/colibri bash scripts/e2e_real_fixture.sh
   bundle:   # the download archives: hubd.exe cross-compiled with mingw-w64, packaged by packaging/make-bundle.sh
     runs-on: ubuntu-latest
     steps:

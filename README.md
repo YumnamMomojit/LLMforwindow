@@ -32,6 +32,6 @@ Or chat in a second terminal: `$H chat` (asks for the key without echoing it, or
 Disable sharing: it is off unless you start with `--share … --i-authorize-public-sharing`. Ctrl-C (also SIGTERM/SIGHUP; on Windows
 Ctrl-Break or closing the console) stops tunnel, gateway and engine, also while the model is still loading. Started with
 `nohup $H serve … &`, hubd keeps the ignored SIGHUP ignored, so serving survives logout; stop it with SIGINT or SIGTERM.
-Tests: `cargo test --workspace`; real engine: `COLIBRI_DIR=third_party/colibri scripts/e2e_real_fixture.sh`.
+Tests: `cargo test --workspace`; real engine: `COLIBRI_DIR=third_party/colibri bash scripts/e2e_real_fixture.sh`.
 
 Docs: `AUDIT` · `ARCHITECTURE` · `SECURITY` · `API` · `SHARING` · `STORAGE` · `WINDOWS` · `CONFIG` · `CONTAINERS` · `VERIFICATION` (all in `docs/`).
