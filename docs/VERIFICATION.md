@@ -1,55 +1,67 @@
 # Verification table
 
-Environment of every "tested" claim: Linux x86_64 container, 4 cores, 15 GB RAM, no GPU, no Windows, no internet beyond package/git proxies,
-no model weights, no Cloudflare account/domain. Date 2026-10-12. Upstream pinned at `bf2442915d6e…` (v2.0.0).
+Every "tested" claim below was made in a Linux x86_64 container (4 cores, 15 GB RAM, no GPU, no Windows, internet only through
+package/git proxies, no model weights, no Cloudflare account). Windows behaviour was exercised only by cross-compiling
+(`x86_64-pc-windows-gnu`) and running the binary under **Wine 9.0**, which is not Windows. Upstream pinned at `bf2442915d6e…` (v2.0.0).
+Dates 2026-10-12/13.
 
-| Requirement | Status | Evidence / command |
+## Test suites
+| Suite | What | Result |
 |---|---|---|
-| Upstream audit, pin | **Done** | `docs/AUDIT.md`, `docs/UPSTREAM.md` |
-| Native engine proof (A) | **Partial** | `make mimo mimo-tiny-generate` (upstream) then `openai_server.py` served `/v1/models`, JSON and SSE chat on the **random-weight MiMo fixture**. Output is noise: proves plumbing, **not** model quality or performance. Linux only. No real model, no Windows, no GPU. |
-| Gateway protocol: auth matrix, revoked/expired, internal key rejected, route allowlist, 405s | **Tested** (mock upstream = *test double*) | `cargo test -p hub-core --test gateway` → 12 passed |
-| Request sanitising, clamp, 413, 415, upstream error mapping | **Tested** (mock) | same |
-| Incremental SSE, `[DONE]`, keepalive comments | **Tested** (mock) and **real engine** (48 events, `verify_remote.py` dry run) | same + `scripts/e2e_real_fixture.sh` |
-| Client disconnect frees slot & drops upstream stream | **Tested** (mock). **Real engine: not proven** — fixture finished before the 1 s cut | gateway test `client_disconnect_cancels_upstream_and_frees_slot` |
-| Bounded queue, no output crossover, per-key rate limit | **Tested** (mock); queue/429/serialisation also observed with 6 parallel curl clients on the real engine (1×429, 5×200) | gateway tests; manual run |
-| Verified usage logged, prompts not logged | **Tested** | `usage_and_metadata_logging_without_prompts` |
-| Real clients: curl, Python stdlib, OpenAI SDK 3.29.0, Node, verify_remote | **Tested** against real engine+fixture (output is noise) | `COLIBRI_DIR=... scripts/e2e_real_fixture.sh`. Asserted: every client exits 0; curl lists the model and streams a non-empty delta and `data: [DONE]`; the stdlib and Node examples exit nonzero without `[DONE]` and must print text (the fixture only emits `reasoning_content`, which they show on stderr); the SDK reports `completion_tokens` ≥ 1 for JSON and in the stream's usage chunk; verify_remote passes |
-| Engine start/readiness/stop, process-tree cleanup | **Tested on Linux**. Real engine: hubd exits 0 and no engine process survives SIGINT, nor SIGTERM in a second run (e2e script). Fake launcher with a child standing in for the engine: SIGINT/SIGTERM/SIGHUP during the model load and while serving, `--startup-timeout` expiry, port/token/cloudflared errors reported before the engine starts. Windows Job Object and console events: **compile only, not run** | e2e script; `cargo test -p hubd --test cli_serve`; `cargo check --target x86_64-pc-windows-gnu` |
-| Actionable engine start errors | **One case tested** (out-of-memory text from a fake launcher → actionable message, exit code 1); the other messages are never triggered by a test or a real engine failure | `cli_serve` |
-| CLI arguments: help anywhere, missing/unknown/extra arguments, flags without values, `--expires-days`/`--grace-hours` ranges, empty tunnel token | **Tested** | `cargo test -p hubd --test cli_args` |
-| Model validation, bad-folder rejection | **Tested** (fixture dir vs empty dir) | `hubd model validate` |
-| Storage: traversal, reserved names, quota-in-write, reserve, overwrite accounting, symlink escape, export/backup, interrupted-write cleanup, migrations | **Tested** Linux | `cargo test -p hub-core --test storage` → 8 passed. Junction test written for Windows CI, **not run** |
-| History: no-history, retention, inert text | **Tested** | storage tests |
-| DPAPI secrets | **Compiles for Windows; not run**; Linux uses 0600 file (dev) | |
-| Cloudflare tunnel | **Implemented, never run** (no account, no cloudflared). cloudflared CLI flags unverified. Only hubd's side is tested, with a fake cloudflared that logs "Registered tunnel connection": `sharing: CONNECTING` → `CONNECTED`, token never printed, connector stopped with hubd | `cli_serve` `sharing_state_is_reported_and_stops_with_hubd` |
-| Public HTTPS reachability, separate-network test | **Blocked / unverified** | needs domain+tunnel; `scripts/verify_remote.py` ready |
-| Windows paths with spaces/Unicode, fresh Windows install, upgrade, uninstall, installer | **Not done** | no Windows host; no installer exists |
-| Desktop UI (Dashboard/Models/Chat/Sharing/Storage/Settings), tray, autostart, Tauri capabilities/CSP | **Not built** (deferred) | upstream stub only |
-| Model catalog/downloads/resume/hash check | **Deferred** | use upstream `coli setup` |
-| GPU fallback tests, VRAM preflight | **Deferred / untested** | |
-| Stop-Sharing-while-chat-continues | Design supports it (`CloudflaredTunnel::stop`); **not exercised** | |
-| Containers | **Roadmap doc only** (`docs/CONTAINERS.md`) | |
+| `cargo test --workspace` | 168 tests: gateway protocol (mock upstream = *test double*), keys, storage, history, engine lifecycle (fake launchers), CLI arguments, `hubd serve` lifecycle and signals, chat client | 168 passed, 0 failed, 1 ignored, three consecutive runs |
+| ignored test `export_handles_files_over_4_gib` | zip64 export of a 4 GiB + 1 file | passed when run in release by a verifier (14 s) |
+| `cargo clippy` (Linux and `--target x86_64-pc-windows-gnu`) | all targets | 0 warnings |
+| `scripts/e2e_real_fixture.sh` | **real** Colibri engine + upstream random-weight MiMo fixture through hubd and the gateway; curl, Python stdlib, OpenAI SDK 3.29.0, Node fetch, `verify_remote.py`; SIGINT/SIGTERM shutdown; then the same from a folder laid out like the official release zip (built with upstream's `pack_python.py`) | pass; no engine process survives |
+| Wine smoke tests | `hubd.exe` init (DPAPI), key create/list/rotate/revoke, strict argument errors, hidden secret prompt; `hub.cmd check`/passthrough from `C:\Program Files (x86)\Local AI Hub` and from paths with `&` and `!`; storage tests for NTFS case identity and backups | pass under Wine (Wine's `cmd` and case folding differ from Windows in places) |
 
-## Review round 2026-10-12
-An independent review made 39 claims; two verifiers checked each: **22 confirmed, 9 disputed** (one verifier said real), **8 refuted**.
-Fixed in the CLI, scripts and docs group (fixes in the core modules are listed separately):
-* `hubd serve` handled only Ctrl-C, and only once serving: Ctrl-C during the model load, SIGTERM or SIGHUP left the engine running on
-  Linux/macOS, and errors after the engine start (port taken, missing token) returned without stopping it. Now stop requests are handled
-  from before the engine starts (Unix: SIGINT/SIGTERM/SIGHUP; Windows: Ctrl-C/Ctrl-Break/console close), every exit path stops the engine,
-  port, token and cloudflared path are checked before the model load, an engine failure exits nonzero, and `--startup-timeout` exists.
-* Model paths were stored as Windows verbatim paths (`\\?\D:\...`), which the C engine cannot open; now stored in plain form (string logic
-  unit-tested on Linux; the Windows `canonicalize` test is written, **not run**).
-* Docs said image/decision engines are rejected at the gateway, which nothing did; they now say "at model validation", where the core
-  fix adds the check.
-* `serve --share` printed `LOCAL ONLY` and never the tunnel state, and an empty tunnel token was accepted; the state is now printed and an
-  empty token is refused.
-* `key create --expires-days` without a value made a never-expiring key; 0, negative and huge values made dead keys or panicked. Now 1..3650.
-* Missing arguments panicked; unknown or extra arguments were ignored (`purge --help` purged). Parsing is now strict; help never acts.
-* The e2e script asserted nothing for four clients and leaked its temp dir on early failure; the rows above now state what it asserts.
-* The portable build script could ship a stale `hubd.exe`, nested folders on re-run, and the bundled Python was unused (still **untested**).
+The fixture's weights are random: its replies are noise. This proves plumbing, not model quality or speed.
+
+## Requirements
+| Requirement | Status | Evidence |
+|---|---|---|
+| Upstream audit and pin | **Done** | `docs/AUDIT.md`, `docs/UPSTREAM.md` |
+| Real inference through the Hub | **Partial**: real engine on a random-weight fixture, Linux only. **No real model run**, no Windows run, no GPU | e2e script |
+| Official release-zip layout (flat, no `c\`) | **Tested** (pack_python.py-built folder) | e2e script, `engine_layout` tests |
+| Model validation (upstream `family_registry`; text-chat families only; GGUF and image/decision models rejected) | **Tested** | `engine_models`, manual |
+| Engine start/readiness/stop, tree cleanup, startup timeout, death detection, actionable errors | **Tested on Linux** (process groups, PR_SET_PDEATHSIG). Windows Job Object: **compiles, not run on Windows** | `engine_*`, `cli_serve`, e2e |
+| Gateway: route allowlist, auth (missing/invalid/revoked/expired, internal key refused), request re-serialisation, limits (body, rate, queue, deadlines, first-byte, idle, keepalive comments), truncation and stalled-client handling, header-read timeout, connection cap with eviction of request-less connections, no keep-alive | **Tested** (mock upstream) | `gateway` tests (raw-TCP probes included) |
+| Incremental SSE, `[DONE]`, verified usage, no prompt logging | **Tested** (mock and real engine) | `gateway`, e2e |
+| Client disconnect cancels generation | **Tested with the mock** (upstream connection dropped, slot freed). **Real engine: not proven** (the fixture answers before a client can leave) | `client_disconnect_cancels_upstream_and_frees_slot` |
+| Simultaneous clients, no crossover | **Tested** (mock); queue/429 observed with 6 parallel clients on the real engine | `bounded_queue_serialises_without_crossover` |
+| API keys: CSPRNG, verifier only, scopes, expiry, rotation grace, clock-independent revocation (schema v3) | **Tested** | `keys_regressions`, `gateway` |
+| Secrets: DPAPI on Windows, 0600 file elsewhere | DPAPI **ran under Wine**, not on Windows | Wine smoke test |
+| Storage: confinement, traversal, reserved/8.3/ADS names, NTFS `$UpCase` identity (checked byte-for-byte against ntfs-3g's Win7+ table), quota during writes, free-space reserve, atomic crash-safe overwrite (kill -9 tested 250x by a verifier), disk-first deletes, atomic export (zip64) and redacted backup | **Tested on Linux**; junction escape test is Windows-only, **not run** | `storage*` tests |
+| History: on/off, retention, inert text | **Tested** | `storage`, CLI |
+| CLI: strict arguments, help, workspace/history/backup/chat commands, nohup-safe, Ctrl-C everywhere in chat, hidden secret prompts | **Tested** (Linux; prompts also under Wine) | `cli_args`, `cli_serve`, `cli2_*`, `cli3_*`, `packaging3_*` |
+| Windows bundle (`make-bundle.sh`): hubd.exe imports only system DLLs; SHA256SUMS; BUILDINFO; third-party licences; reproducible across checkout paths | **Built and checked on one Linux host**; CI bundle job written, **not run on GitHub** | bundle inspection |
+| `hub.cmd` Python detection via `py`/`python` | **Not tested** (no Windows Python available here) | — |
+| GPU (`COLI_VULKAN=1`) | Documented from upstream source, **not tested** (no GPU); CUDA zip **not supported** by the Hub | `docs/WINDOWS.md` |
+| Cloudflare tunnel, public HTTPS, separate-network test | **Implemented, never run** (no account/domain); `verify_remote.py` ready | `docs/SHARING.md` |
+| Windows install/upgrade/uninstall, signing | **Not done**: zip only, unsigned, no installer | — |
+| Desktop UI, tray, autostart | **Not built** | — |
+| Model downloads in the Hub | **Deferred**: use upstream `coli setup` | README-FIRST |
+| Containers | **Roadmap only** | `docs/CONTAINERS.md` |
+
+## Review rounds
+Independent multi-agent reviews, each claim checked by two skeptical verifiers before acting on it:
+1. Initial code: 39 claims → 22 confirmed, 9 disputed, 8 refuted. All fixed with regression tests (5 file groups).
+2. Check of those fixes: 25/31 fully fixed, 6 partial; 14 new defects introduced by the fixes. Fixed, plus a first review of the new
+   CLI/packaging code (about 20 more issues).
+3. Check of round 2: 43/45 confirmed fixed; 22 new findings (user-flow and Windows hunters), including a high-severity setup bug
+   (embeddable Python breaks the engine) and a pooled-connection race through cloudflared. Fixed; the untested PowerShell
+   packaging script was removed.
+4. Release gate on round 3: see the end of this file.
+
+Found outside the reviews while packaging: the Hub originally rejected the official release zip's flat layout (would have failed for
+every user of the official download); fixed and covered by tests and the e2e script.
+
+Known, accepted limits: a client that reads one byte at a time keeps its socket until the request deadline; connection floods at
+hundreds of thousands per second from the local machine/LAN are out of scope (Cloudflare's edge for internet exposure); exFAT data
+directories follow NTFS case rules (rare Greek/Cyrillic edge cases differ); the v3 migration trusts the clock at upgrade time.
 
 ## Smallest remaining validation
-1. Windows 11 box: `cargo test --workspace` (runs the junction test) and `scripts\e2e` equivalent with the Windows release engines + a fixture.
-2. Load one real small model (e.g. Qwen3-Coder-30B-A3B, 19 GB) and run a real client conversation; then cancel a long generation mid-stream and confirm engine CANCEL in the log.
-3. Create the named tunnel, run `verify_remote.py --from-separate-network` from a phone hotspot; check long-prefill streaming past 100 s.
-4. Build the Tauri shell screens and installer, then clean-VM install/upgrade/uninstall.
+1. On a Windows 11 PC: unzip the bundle, follow README-FIRST.txt, run `hub.cmd check`, a real small model, `hub.cmd chat`, the local API
+   with `examples\powershell.ps1`, and `cargo test --workspace` from source (runs the junction test).
+2. Cancel a long real generation mid-stream and confirm the engine logs the CANCEL.
+3. Create the named tunnel and run `verify_remote.py --from-separate-network` from a phone hotspot, with a prompt long enough to prefill > 100 s.
+4. Desktop UI and a signed installer.
