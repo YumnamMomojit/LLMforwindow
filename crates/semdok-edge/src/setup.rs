@@ -127,7 +127,7 @@ pub(crate) fn check(dir: &Path, python: Option<PathBuf>, colibri: Option<PathBuf
     println!("Semdok Edge setup check");
     if let Ok(me) = std::env::current_exe() {
         println!(
-            "  semdok-edge     : {} (version {})",
+            "  program  : {} (Semdok Edge {})",
             me.display(),
             env!("CARGO_PKG_VERSION")
         );
