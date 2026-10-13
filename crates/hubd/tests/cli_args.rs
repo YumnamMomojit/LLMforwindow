@@ -267,6 +267,63 @@ fn expires_days_is_a_bounded_positive_whole_number() {
 }
 
 #[test]
+fn max_output_tokens_is_bounded_and_documented() {
+    let s = Scratch::new("max-out");
+    for bad in ["0", "-1", "32769", "4k", "1e3"] {
+        let o = hubd(
+            &s.data(),
+            &[
+                "serve",
+                "--model",
+                "m",
+                "--colibri-dir",
+                "c",
+                "--max-output-tokens",
+                bad,
+            ],
+            "",
+        );
+        assert_usage_error(
+            &o,
+            "--max-output-tokens must be a whole number from 1 to 32768",
+        );
+    }
+    let o = hubd(
+        &s.data(),
+        &[
+            "serve",
+            "--model",
+            "m",
+            "--colibri-dir",
+            "c",
+            "--max-output-tokens",
+        ],
+        "",
+    );
+    assert_usage_error(&o, "--max-output-tokens needs a value");
+    assert!(!s.data().exists(), "a usage error touched the data dir");
+    // The help names the flag with the gateway's actual defaults.
+    let d = hub_core::gateway::GatewayConfig::default();
+    let help = hubd(&s.data(), &["--help"], "").stdout;
+    assert!(help.contains("[--max-output-tokens N]"), "{help}");
+    assert!(
+        help.contains(&format!("(1..32768, default {})", d.max_output_tokens)),
+        "{help}"
+    );
+    assert!(
+        help.contains(&format!(
+            "a request without max_tokens gets {}",
+            d.default_output_tokens
+        )),
+        "{help}"
+    );
+    assert!(
+        !help.contains("{MAX_OUT}") && !help.contains("{DEFAULT_OUT}"),
+        "{help}"
+    );
+}
+
+#[test]
 fn grace_hours_is_bounded() {
     let s = Scratch::new("grace");
     init(&s);

@@ -160,17 +160,34 @@ pub fn workspace(dir: &Path, mut args: Args) -> Result<()> {
             let mut out = out.open(&dest).with_context(|| {
                 format!("cannot write {} (exists? use --overwrite)", dest.display())
             })?;
-            let n = match std::io::copy(&mut src, &mut out).and_then(|n| out.sync_all().map(|()| n))
-            {
+            // A FIFO, a terminal or a device (`/dev/stdout`, `| less`) is written as a stream:
+            // fsync means nothing there (it fails with EINVAL), and the path is never ours to
+            // remove.
+            let regular = out.metadata().is_ok_and(|m| m.is_file());
+            let copied = std::io::copy(&mut src, &mut out).and_then(|n| {
+                if regular {
+                    out.sync_all()?;
+                }
+                Ok(n)
+            });
+            let n = match copied {
                 Ok(n) => n,
                 Err(e) => {
-                    // Never leave a cut-off copy that looks complete.
-                    drop(out);
-                    let _ = std::fs::remove_file(&dest);
-                    return Err(e).with_context(|| format!("writing {} failed", dest.display()));
+                    let what = if regular {
+                        discard_partial(&dest, out)
+                    } else {
+                        ""
+                    };
+                    return Err(e)
+                        .with_context(|| format!("writing {} failed{what}", dest.display()));
                 }
             };
-            println!("wrote {} ({})", dest.display(), mb(n));
+            if regular {
+                println!("wrote {} ({})", dest.display(), mb(n));
+            } else {
+                // stdout may be the destination itself.
+                eprintln!("wrote {} ({})", dest.display(), mb(n));
+            }
         }
         "rm" => {
             let yes = args.switch("--yes");
@@ -225,6 +242,40 @@ pub fn workspace(dir: &Path, mut args: Args) -> Result<()> {
         _ => return Err(usage_error(format!("unknown workspace subcommand '{sub}'"))),
     }
     Ok(())
+}
+
+/// After a failed copy into the regular file `out` opened at `dest`: never leave a cut-off
+/// copy that looks complete. The path is removed only when it names that very file; through
+/// a symlink (or if the path was replaced meanwhile) the file is emptied instead, so the link
+/// and whatever the path now names stay. Returns what was done, for the error message.
+fn discard_partial(dest: &Path, out: std::fs::File) -> &'static str {
+    let is_dest = match (out.metadata(), std::fs::symlink_metadata(dest)) {
+        (Ok(opened), Ok(at_path)) => at_path.is_file() && same_file(&opened, &at_path),
+        _ => false,
+    };
+    // Emptied first, so a removal that fails still leaves nothing that looks complete.
+    let emptied = out.set_len(0).is_ok();
+    drop(out); // Windows cannot remove a file that is still open
+    if is_dest && std::fs::remove_file(dest).is_ok() {
+        "; the partial copy was removed"
+    } else if emptied {
+        "; the partial copy was emptied"
+    } else {
+        ""
+    }
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// No stable file id on Windows: `symlink_metadata` being a regular file (not a link) is the
+/// check that remains.
+#[cfg(windows)]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    true
 }
 
 pub fn backup(dir: &Path, mut args: Args) -> Result<()> {
@@ -369,74 +420,209 @@ impl Interrupt {
     }
 }
 
-/// Terminal echo off while it lives; the saved mode is put back on drop.
+/// Terminal echo off while it lives; the saved mode is put back on drop. Also put back when
+/// the process is ended meanwhile by a signal or console event it does not handle itself
+/// (SIGTERM, SIGQUIT, SIGHUP; Ctrl-Break, closing the console), whose default action would
+/// otherwise leave the shell with a terminal that shows nothing typed. Ctrl-C is not one of
+/// them: `Interrupt` turns it into an ordinary event, and the guard is dropped as usual.
+/// One guard at a time (a prompt is open at most once at a time).
 struct NoEcho {
     #[cfg(unix)]
     saved: libc::termios,
+    /// Signals given `restore_echo_and_reraise`, with the action each had before.
+    #[cfg(unix)]
+    handlers: Vec<(libc::c_int, libc::sigaction)>,
     #[cfg(windows)]
     saved: (windows_sys::Win32::Foundation::HANDLE, u32),
+}
+
+/// The terminal mode a signal handler puts back: written before the handlers are installed,
+/// read only by them.
+#[cfg(unix)]
+struct SavedTermios(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
+// SAFETY: written only while no handler that reads it is installed (see `NoEcho::new`).
+#[cfg(unix)]
+unsafe impl Sync for SavedTermios {}
+#[cfg(unix)]
+static SAVED_TERMIOS: SavedTermios =
+    SavedTermios(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
+
+/// Only async-signal-safe calls (tcsetattr, raise). SA_RESETHAND has already put the default
+/// action back, so the raised signal ends the process as it would have without this handler
+/// (same exit status, core dump for SIGQUIT) once the handler returns.
+#[cfg(unix)]
+extern "C" fn restore_echo_and_reraise(sig: libc::c_int) {
+    // SAFETY: SAVED_TERMIOS was initialised before this handler was installed.
+    unsafe {
+        libc::tcsetattr(
+            libc::STDIN_FILENO,
+            libc::TCSANOW,
+            (*SAVED_TERMIOS.0.get()).as_ptr(),
+        );
+        libc::raise(sig);
+    }
+}
+
+#[cfg(windows)]
+static SAVED_CONSOLE: (
+    std::sync::atomic::AtomicPtr<std::ffi::c_void>,
+    std::sync::atomic::AtomicU32,
+) = (
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+    std::sync::atomic::AtomicU32::new(0),
+);
+
+/// Runs on its own thread for every console event while a prompt is open (handlers run newest
+/// first). Puts the console mode back for the events that end the process, then lets the next
+/// handler decide: Ctrl-C goes on to `Interrupt`, the rest to the default (exit).
+#[cfg(windows)]
+unsafe extern "system" fn restore_console_on_exit(
+    event: u32,
+) -> windows_sys::Win32::Foundation::BOOL {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows_sys::Win32::System::Console::{SetConsoleMode, CTRL_C_EVENT};
+    let h = SAVED_CONSOLE.0.load(SeqCst);
+    if event != CTRL_C_EVENT && !h.is_null() {
+        SetConsoleMode(h, SAVED_CONSOLE.1.load(SeqCst));
+    }
+    0
 }
 
 impl NoEcho {
     #[cfg(unix)]
     fn new() -> Option<Self> {
-        // SAFETY: termios calls on stdin with a struct that tcgetattr fills in.
+        // SAFETY: termios calls on stdin with a struct that tcgetattr fills in; sigaction with
+        // zeroed structs filled in here. No handler is installed while SAVED_TERMIOS is written.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
                 return None;
             }
             let saved = t;
+            (*SAVED_TERMIOS.0.get()).write(saved);
+            let mut handlers = vec![];
+            for sig in [libc::SIGTERM, libc::SIGQUIT, libc::SIGHUP] {
+                // Only where the default action applies: an ignored SIGHUP (nohup) stays
+                // ignored, and a handler someone else installed stays theirs.
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
+                    || old.sa_sigaction != libc::SIG_DFL
+                {
+                    continue;
+                }
+                let mut new: libc::sigaction = std::mem::zeroed();
+                new.sa_sigaction =
+                    restore_echo_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                new.sa_flags = libc::SA_RESETHAND;
+                libc::sigemptyset(&mut new.sa_mask);
+                if libc::sigaction(sig, &new, std::ptr::null_mut()) == 0 {
+                    handlers.push((sig, old));
+                }
+            }
+            let guard = Self { saved, handlers };
             t.c_lflag &= !libc::ECHO;
-            (libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) == 0).then_some(Self { saved })
+            // On failure the guard's drop puts the handlers back.
+            (libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) == 0).then_some(guard)
         }
     }
 
     #[cfg(windows)]
     fn new() -> Option<Self> {
+        use std::sync::atomic::Ordering::SeqCst;
         use windows_sys::Win32::System::Console::{
-            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
+            GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode, ENABLE_ECHO_INPUT,
+            STD_INPUT_HANDLE,
         };
-        // SAFETY: console mode calls on this process's own stdin handle.
+        // SAFETY: console mode calls on this process's own stdin handle; the handler routine
+        // only reads the two atomics.
         unsafe {
             let h = GetStdHandle(STD_INPUT_HANDLE);
             let mut mode = 0;
             if GetConsoleMode(h, &mut mode) == 0 {
                 return None;
             }
-            (SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT) != 0).then_some(Self { saved: (h, mode) })
+            SAVED_CONSOLE.1.store(mode, SeqCst);
+            SAVED_CONSOLE.0.store(h, SeqCst);
+            SetConsoleCtrlHandler(Some(restore_console_on_exit), 1);
+            let guard = Self { saved: (h, mode) };
+            // On failure the guard's drop removes the handler again.
+            (SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT) != 0).then_some(guard)
         }
     }
 }
 
 impl Drop for NoEcho {
     fn drop(&mut self) {
-        // SAFETY: restores the mode read in `new` on the same handle.
+        // SAFETY: restores the mode read in `new` on the same handle, then the signal actions
+        // (console handler) that `new` replaced (added). A signal in between finds the mode
+        // already restored and ends the process as it would have anyway.
         #[cfg(unix)]
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
+            for (sig, old) in &self.handlers {
+                libc::sigaction(*sig, old, std::ptr::null_mut());
+            }
         }
         #[cfg(windows)]
         unsafe {
-            windows_sys::Win32::System::Console::SetConsoleMode(self.saved.0, self.saved.1);
+            use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, SetConsoleMode};
+            SetConsoleMode(self.saved.0, self.saved.1);
+            SetConsoleCtrlHandler(Some(restore_console_on_exit), 0);
+            SAVED_CONSOLE
+                .0
+                .store(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
 
+/// What to show before reading a secret at a terminal.
+pub(crate) struct SecretPrompt {
+    /// When the typing is hidden.
+    hidden: &'static str,
+    /// When it cannot be: e.g. Git Bash's mintty without a pseudo console, whose pty reaches a
+    /// Windows program as a pipe that still counts as a terminal but has no console mode.
+    visible: &'static str,
+}
+
+pub(crate) const TUNNEL_TOKEN_PROMPT: SecretPrompt = SecretPrompt {
+    hidden: "tunnel token (typing is hidden): ",
+    visible: "warning: this terminal cannot hide what you type, so the token will be shown \
+              on screen and kept in the scrollback. To avoid that, press Ctrl-C and use \
+              `hubd secret set tunnel_token < token.txt` (or run it from cmd or PowerShell).\n\
+              tunnel token (VISIBLE as you type): ",
+};
+
+const CHAT_KEY_PROMPT: SecretPrompt = SecretPrompt {
+    hidden: "API key (lah_...; typing is hidden; set HUB_API_KEY to skip this): ",
+    visible: "warning: this terminal cannot hide what you type, so the key will be shown on \
+              screen and kept in the scrollback. To avoid that, press Ctrl-C and set \
+              HUB_API_KEY instead (or run the chat from cmd or PowerShell).\n\
+              API key (lah_...; VISIBLE as you type): ",
+};
+
 /// One line from stdin for a key or token, without its line ending. At a terminal the prompt
 /// goes to stderr and the typing is not shown, so the secret stays off the screen and out of
-/// the scrollback; from a pipe the line is read as it comes, with no prompt. Ctrl-C cancels
-/// either way (and puts the terminal back first).
-pub(crate) async fn read_secret_line(prompt: &str, intr: &mut Interrupt) -> Result<String> {
+/// the scrollback (or, where the terminal cannot hide it, the prompt says so); from a pipe the
+/// line is read as it comes, with no prompt. Ctrl-C cancels either way (and puts the terminal
+/// back first).
+pub(crate) async fn read_secret_line(
+    prompt: &SecretPrompt,
+    intr: &mut Interrupt,
+) -> Result<String> {
     use std::io::IsTerminal;
     let tty = std::io::stdin().is_terminal();
-    let echo = if tty {
-        eprint!("{prompt}");
+    let echo = if tty { NoEcho::new() } else { None };
+    if tty {
+        eprint!(
+            "{}",
+            if echo.is_some() {
+                prompt.hidden
+            } else {
+                prompt.visible
+            }
+        );
         std::io::stderr().flush()?;
-        NoEcho::new()
-    } else {
-        None
-    };
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     // A thread, not the runtime: a blocked read must not keep Ctrl-C from being handled.
     std::thread::spawn(move || {
@@ -525,6 +711,94 @@ fn chat_input(line: &str) -> ChatInput<'_> {
     }
 }
 
+/// Longest wait for `GET /models`, which the local API answers at once.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest wait for a whole reply. The local API ends a stream after 15 minutes (and sends
+/// keepalives while the model reads the prompt), so this only bounds a server that hangs.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// `work`, unless Ctrl-C comes first.
+async fn or_ctrl_c<T>(
+    intr: &mut Interrupt,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        r = work => r,
+        _ = intr.recv() => Err(anyhow!("cancelled")),
+    }
+}
+
+/// Blocking work on a thread of its own, so that the runtime (and Ctrl-C) stays responsive
+/// meanwhile. Not `spawn_blocking`: the runtime waits for those at exit, so a cancelled wait
+/// would still hold the process.
+fn on_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> impl std::future::Future<Output = Result<T>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    async move {
+        rx.await
+            .map_err(|_| anyhow!("internal error: a worker thread failed"))
+    }
+}
+
+/// A failed request to the local API, worded for what most likely happened.
+fn unreachable_api(base: &str, wait: Duration, e: reqwest::Error) -> anyhow::Error {
+    if e.is_timeout() && !e.is_connect() {
+        anyhow!(
+            "{base} accepted the connection but did not answer within {} s: is `hubd serve` \
+             suspended (Ctrl-Z) or stuck?",
+            wait.as_secs()
+        )
+    } else {
+        anyhow::Error::new(e).context(format!("cannot reach {base}: is `hubd serve` running?"))
+    }
+}
+
+/// The id of the first model the server lists.
+async fn first_model(http: &reqwest::Client, base: &str, key: &str) -> Result<String> {
+    let fail = |e| unreachable_api(base, MODELS_TIMEOUT, e);
+    let r = http
+        .get(format!("{base}/models"))
+        .bearer_auth(key)
+        .timeout(MODELS_TIMEOUT)
+        .send()
+        .await
+        .map_err(fail)?;
+    let st = r.status();
+    let v: Value = serde_json::from_slice(&r.bytes().await.map_err(fail)?).unwrap_or(Value::Null);
+    if !st.is_success() {
+        bail!(
+            "{st}: {}",
+            clean_line(v["error"]["message"].as_str().unwrap_or("request failed"))
+        );
+    }
+    Ok(v["data"][0]["id"]
+        .as_str()
+        .context("the server lists no model")?
+        .to_string())
+}
+
+/// What a reply that ended at its token limit (`finish_reason: "length"`) gets said about it.
+/// `completion_tokens` below the `--max-tokens` asked for means the server lowered the limit.
+fn length_notes(asked: Option<i64>, completion_tokens: Option<i64>) -> Vec<String> {
+    let mut notes = vec![
+        "[reply stopped at the token limit; use --max-tokens N, up to the server limit]"
+            .to_string(),
+    ];
+    if let (Some(asked), Some(got)) = (asked, completion_tokens) {
+        if (1..asked).contains(&got) {
+            notes.push(format!(
+                "[the server limits replies to {got} tokens, fewer than the {asked} asked for; \
+                 `hubd serve --max-output-tokens N` raises that limit]"
+            ));
+        }
+    }
+    notes
+}
+
 pub async fn chat(dir: &Path, mut args: Args) -> Result<()> {
     let o = ChatOpts {
         url: args
@@ -544,19 +818,14 @@ pub async fn chat(dir: &Path, mut args: Args) -> Result<()> {
         bail!("hubd chat talks to the local API only (http://127.0.0.1:<port>/v1); for a remote endpoint use the examples/");
     }
     let base = o.url.trim_end_matches('/').to_string();
+    // From here on Ctrl-C is an event, not the end of the process: every wait below races it.
     let mut intr = Interrupt::new()?;
     let key = match std::env::var("HUB_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())
     {
         Some(k) => k,
-        None => {
-            read_secret_line(
-                "API key (lah_...; typing is hidden; set HUB_API_KEY to skip this): ",
-                &mut intr,
-            )
-            .await?
-        }
+        None => read_secret_line(&CHAT_KEY_PROMPT, &mut intr).await?,
     };
     let key = key.trim().to_string();
     if !key.starts_with("lah_") {
@@ -581,34 +850,23 @@ pub async fn chat(dir: &Path, mut args: Args) -> Result<()> {
         .build()?;
     let model = match o.model.clone() {
         Some(m) => m,
-        None => {
-            let r = http
-                .get(format!("{base}/models"))
-                .bearer_auth(&key)
-                .send()
-                .await
-                .with_context(|| format!("cannot reach {base}: is `hubd serve` running?"))?;
-            let st = r.status();
-            let v: Value = r.json().await.unwrap_or(Value::Null);
-            if !st.is_success() {
-                bail!(
-                    "{st}: {}",
-                    clean_line(v["error"]["message"].as_str().unwrap_or("request failed"))
-                );
-            }
-            v["data"][0]["id"]
-                .as_str()
-                .context("the server lists no model")?
-                .to_string()
-        }
+        None => or_ctrl_c(&mut intr, first_model(&http, &base, &key)).await?,
     };
-    // History is optional: without a usable database the chat still works, unsaved.
+    // History is optional: without a usable database the chat still works, unsaved. Opened on
+    // its own thread: a database another process holds locked can take seconds.
     let mut db_conn = if o.no_history {
         None
     } else {
-        match db::open(&dir.join("hub.db")) {
-            Ok(c) if history::enabled(&c) => Some(c),
-            Ok(_) => None,
+        let path = dir.join("hub.db");
+        let opened = on_thread(move || {
+            db::open(&path).map(|c| {
+                let on = history::enabled(&c);
+                (c, on)
+            })
+        });
+        match or_ctrl_c(&mut intr, opened).await? {
+            Ok((c, true)) => Some(c),
+            Ok((_, false)) => None,
             Err(e) => {
                 eprintln!("note: chat history cannot be saved: {e:#}");
                 None
@@ -676,7 +934,14 @@ pub async fn chat(dir: &Path, mut args: Args) -> Result<()> {
             ChatInput::Message => {}
         }
         msgs.push(json!({"role": "user", "content": line}));
-        let mut body = json!({"model": model, "messages": msgs, "stream": true});
+        // Usage too: with `finish_reason: "length"` it shows whether the server lowered the
+        // limit asked for.
+        let mut body = json!({
+            "model": model,
+            "messages": msgs,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
         if let Some(m) = o.max_tokens {
             body["max_tokens"] = json!(m);
         }
@@ -685,7 +950,16 @@ pub async fn chat(dir: &Path, mut args: Args) -> Result<()> {
             _ = intr.recv() => Err(anyhow!("stopped")),
         };
         match reply {
-            Ok(text) => {
+            Ok(Reply {
+                text,
+                finish,
+                completion_tokens,
+            }) => {
+                if finish.as_deref() == Some("length") {
+                    for note in length_notes(o.max_tokens, completion_tokens) {
+                        println!("{note}");
+                    }
+                }
                 msgs.push(json!({"role": "assistant", "content": text}));
                 // Saved per answered turn; the conversation row comes with the first one, so
                 // a chat whose requests all fail leaves no empty conversation behind.
@@ -791,22 +1065,31 @@ impl SseParser {
     }
 }
 
-/// Streams one reply to stdout and returns its text. Thinking (`reasoning_content`) is shown
-/// on stderr and not kept in the conversation. Everything the server sends is shown inert.
+/// One streamed reply.
+struct Reply {
+    text: String,
+    /// The last `finish_reason` the server sent: "stop", "length", ...
+    finish: Option<String>,
+    /// From the usage event, if the server sent one.
+    completion_tokens: Option<i64>,
+}
+
+/// Streams one reply to stdout and returns it. Thinking (`reasoning_content`) is shown on
+/// stderr and not kept in the conversation. Everything the server sends is shown inert.
 async fn stream_reply(
     http: &reqwest::Client,
     base: &str,
     key: &str,
     body: &Value,
-) -> Result<String> {
+) -> Result<Reply> {
     let r = http
         .post(format!("{base}/chat/completions"))
         .bearer_auth(key)
         .json(body)
-        .timeout(Duration::from_secs(3600))
+        .timeout(REPLY_TIMEOUT)
         .send()
         .await
-        .context("cannot reach the local API: is `hubd serve` running?")?;
+        .map_err(|e| unreachable_api(base, REPLY_TIMEOUT, e))?;
     let st = r.status();
     if !st.is_success() {
         let v: Value = r.json().await.unwrap_or(Value::Null);
@@ -816,14 +1099,26 @@ async fn stream_reply(
             clean_line(v["error"]["code"].as_str().unwrap_or("-"))
         );
     }
-    let (mut sse, mut text, mut out) = (SseParser::default(), String::new(), std::io::stdout());
+    let (mut sse, mut out) = (SseParser::default(), std::io::stdout());
+    let mut reply = Reply {
+        text: String::new(),
+        finish: None,
+        completion_tokens: None,
+    };
     let mut thinking = false;
     let mut s = r.bytes_stream();
     while let Some(chunk) = s.next().await {
-        for data in sse.push(&chunk?)? {
+        let chunk = chunk.map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("the reply took longer than {} s", REPLY_TIMEOUT.as_secs())
+            } else {
+                anyhow::Error::new(e)
+            }
+        })?;
+        for data in sse.push(&chunk)? {
             if data.trim() == "[DONE]" {
                 println!();
-                return Ok(text);
+                return Ok(reply);
             }
             let v: Value = serde_json::from_str(&data).context("malformed stream event")?;
             if let Some(e) = v.get("error") {
@@ -832,6 +1127,12 @@ async fn stream_reply(
                     clean_line(e["message"].as_str().unwrap_or("error")),
                     clean_line(e["code"].as_str().unwrap_or("-"))
                 );
+            }
+            if let Some(f) = v["choices"][0]["finish_reason"].as_str() {
+                reply.finish = Some(f.to_string());
+            }
+            if let Some(n) = v["usage"]["completion_tokens"].as_i64() {
+                reply.completion_tokens = Some(n);
             }
             let d = &v["choices"][0]["delta"];
             if let Some(t) = d["reasoning_content"].as_str() {
@@ -843,7 +1144,7 @@ async fn stream_reply(
                     eprintln!(); // the answer starts on its own line after the thinking
                     thinking = false;
                 }
-                text.push_str(t);
+                reply.text.push_str(t);
                 write!(out, "{}", clean(t))?;
                 out.flush()?;
             }
@@ -976,5 +1277,79 @@ mod tests {
     #[test]
     fn listing_fields_stay_on_one_line() {
         assert_eq!(clean_line("a\tb\nc\x1b[2Jd"), "a b c[2Jd");
+    }
+
+    /// The prompt that shows while the typing is visible never claims otherwise, and says
+    /// how to keep the secret off the screen.
+    #[test]
+    fn a_visible_prompt_says_so() {
+        for (p, way_out) in [
+            (&TUNNEL_TOKEN_PROMPT, "< token.txt"),
+            (&CHAT_KEY_PROMPT, "HUB_API_KEY"),
+        ] {
+            assert!(p.hidden.contains("typing is hidden"), "{}", p.hidden);
+            assert!(!p.visible.contains("hidden"), "{}", p.visible);
+            assert!(p.visible.contains("VISIBLE"), "{}", p.visible);
+            assert!(p.visible.contains(way_out), "{}", p.visible);
+        }
+    }
+
+    #[test]
+    fn a_reply_cut_at_its_limit_is_marked_and_a_lowered_limit_named() {
+        let plain =
+            "[reply stopped at the token limit; use --max-tokens N, up to the server limit]";
+        assert_eq!(length_notes(None, Some(1024)), [plain]);
+        assert_eq!(length_notes(None, None), [plain]);
+        assert_eq!(length_notes(Some(500), Some(500)), [plain]);
+        assert_eq!(length_notes(Some(500), None), [plain]);
+        let lowered = length_notes(Some(8000), Some(4096));
+        assert_eq!(lowered[0], plain);
+        assert!(
+            lowered[1].contains("limits replies to 4096 tokens, fewer than the 8000 asked for")
+                && lowered[1].contains("--max-output-tokens"),
+            "{lowered:?}"
+        );
+    }
+
+    /// After a failed `workspace get`: the file the path names is removed; a symlinked file is
+    /// emptied and the link kept; nothing else is touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_removes_only_its_own_file() {
+        let d = std::env::temp_dir().join(format!("hubd-discard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let write = |p: &Path| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(p)
+                .unwrap();
+            f.write_all(b"half a co").unwrap();
+            f
+        };
+        let plain = d.join("plain.txt");
+        let f = write(&plain);
+        assert!(discard_partial(&plain, f).contains("removed"));
+        assert!(!plain.exists());
+
+        let target = d.join("target.txt");
+        let link = d.join("link.txt");
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let f = write(&link);
+        assert!(discard_partial(&link, f).contains("emptied"));
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+
+        // The path was replaced while the copy ran: the replacement stays.
+        let moved = d.join("moved.txt");
+        let f = write(&moved);
+        std::fs::rename(&moved, d.join("elsewhere.txt")).unwrap();
+        std::fs::write(&moved, "someone else's").unwrap();
+        discard_partial(&moved, f);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"someone else's");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

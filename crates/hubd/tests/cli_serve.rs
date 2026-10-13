@@ -4,7 +4,8 @@
 //! (SIGINT, SIGTERM, SIGHUP) during a model load and while serving tears the whole tree down;
 //! a SIGHUP ignored from the start (nohup) stays ignored;
 //! failures that do not need the engine are reported before it starts; engine start failures
-//! exit nonzero with the actionable message. Linux only (process liveness is read from /proc);
+//! exit nonzero with the actionable message; `--max-output-tokens` reaches both the engine
+//! and the gateway, and `hubd chat` marks a reply cut there. Linux only (process liveness is read from /proc);
 //! on Windows the Job Object owns the tree and the console events are not tested here.
 #![cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Read};
@@ -42,6 +43,8 @@ if mode == "crash":
     sys.exit(1)
 engine = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
 pids = os.environ["FAKE_ENGINE_PIDS"]
+with open(pids + ".args", "w") as f:  # complete before the pids file appears
+    json.dump(args, f)
 with open(pids + ".tmp", "w") as f:
     f.write(f"{os.getpid()} {engine.pid}")
 os.replace(pids + ".tmp", pids)
@@ -56,6 +59,23 @@ class Models(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # Streams "max_tokens=N" (the limit it was sent), then stops there as a cut reply does:
+    # finish_reason "length" and, if asked for, usage with N completion tokens.
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        n = body.get("max_tokens")
+        def event(obj):
+            self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        event({"choices": [{"index": 0, "delta": {"content": f"max_tokens={n}"}, "finish_reason": None}]})
+        event({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]})
+        if (body.get("stream_options") or {}).get("include_usage"):
+            event({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": n, "total_tokens": n + 1}})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def log_message(self, *a):
         pass
@@ -615,4 +635,103 @@ fn sharing_state_is_reported_and_stops_with_hubd() {
     assert!(status.success(), "{status}\n{}", s.err());
     assert!(!s.out().contains(token) && !s.err().contains(token));
     assert_tree_gone(&[pids, vec![tunnel]].concat());
+}
+
+impl Served {
+    /// The local API's base URL, once serving.
+    fn api_url(&self) -> String {
+        assert!(
+            wait_until(Duration::from_secs(30), || self
+                .out()
+                .contains("Ctrl-C to stop")),
+            "not ready\nstdout: {}\nstderr: {}",
+            self.out(),
+            self.err()
+        );
+        let out = self.out();
+        let rest = &out[out.find("local API ready:").unwrap()..];
+        let url = rest.split_whitespace().nth(3).unwrap();
+        assert!(url.starts_with("http://127.0.0.1:"), "{out}");
+        url.to_string()
+    }
+
+    /// The arguments the fake launcher was started with.
+    fn engine_args(&self) -> serde_json::Value {
+        let p = format!("{}.args", self.pids.display());
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    }
+}
+
+/// `--max-output-tokens` is the engine's `--max-tokens` and the gateway's cap; `hubd chat`
+/// asking for more is told that the server lowered it.
+#[test]
+fn max_output_tokens_caps_engine_and_gateway_and_chat_says_so() {
+    let Some(f) = fixture("max-out") else {
+        return;
+    };
+    let created = ok(hubd(&f.data).args(["key", "create", "t"]));
+    let key = created.lines().last().unwrap().trim().to_string();
+    assert!(key.starts_with("lah_"), "{created}");
+    let mut s = f.serve("serve", 0, &["--max-output-tokens", "77"]);
+    s.wait_for_engine();
+    let url = s.api_url();
+    assert_eq!(s.engine_args()["--max-tokens"], "77");
+    assert!(s.out().contains("replies: up to 77 tokens"), "{}", s.out());
+    let chat = |extra: &[&str]| {
+        let mut child = hubd(&f.data)
+            .args(["chat", "--no-history", "--url", &url])
+            .args(extra)
+            .env("HUB_API_KEY", &key)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let cut = "[reply stopped at the token limit; use --max-tokens N, up to the server limit]";
+    // More than the cap: the engine is sent the cap, and chat names the lowered limit.
+    let out = chat(&["--max-tokens", "5000"]);
+    assert!(out.contains("max_tokens=77"), "{out}");
+    assert!(out.contains(cut), "{out}");
+    assert!(
+        out.contains("the server limits replies to 77 tokens, fewer than the 5000 asked for"),
+        "{out}"
+    );
+    // No --max-tokens: the server's default, itself within the cap.
+    let out = chat(&[]);
+    assert!(out.contains("max_tokens=77"), "{out}");
+    assert!(out.contains(cut) && !out.contains("fewer than"), "{out}");
+    s.signal("TERM");
+    assert!(s.wait_exit().success(), "{}", s.err());
+}
+
+#[test]
+fn max_output_tokens_defaults_to_the_gateway_default() {
+    let Some(f) = fixture("max-out-default") else {
+        return;
+    };
+    let mut s = f.serve("serve", 0, &[]);
+    s.wait_for_engine();
+    s.api_url();
+    let d = hub_core::gateway::GatewayConfig::default();
+    assert_eq!(
+        s.engine_args()["--max-tokens"],
+        d.max_output_tokens.to_string()
+    );
+    assert!(
+        s.out().contains(&format!(
+            "replies: up to {} tokens (--max-output-tokens); {} when a request sets no max_tokens",
+            d.max_output_tokens,
+            d.default_output_tokens.min(d.max_output_tokens)
+        )),
+        "{}",
+        s.out()
+    );
+    s.signal("TERM");
+    assert!(s.wait_exit().success(), "{}", s.err());
 }

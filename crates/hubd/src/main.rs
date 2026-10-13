@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "hubd - Local AI Hub
+const USAGE_TEXT: &str = "hubd - Local AI Hub
 
 USAGE: hubd [--data-dir DIR] <command>
 
@@ -22,11 +22,16 @@ USAGE: hubd [--data-dir DIR] <command>
   key list | key revoke <id> | key rotate <id> [--grace-hours N]   (N = 0..720, default 24)
   secret set tunnel_token               (reads one line from stdin; typing at a terminal is hidden)
   serve --model ID [--colibri-dir C] [--python P] [--port N] [--max-active N]
-        [--startup-timeout SECS] [--share --cloudflared EXE --hostname H --i-authorize-public-sharing]
+        [--startup-timeout SECS] [--max-output-tokens N]
+        [--share --cloudflared EXE --hostname H --i-authorize-public-sharing]
+                                         --max-output-tokens: longest reply the API gives, in tokens
+                                         (1..32768, default {MAX_OUT}); a request without max_tokens gets {DEFAULT_OUT}
   purge                                  apply history/log retention
   chat [--model ID] [--system TEXT] [--max-tokens N] [--no-history] [--url http://127.0.0.1:8787/v1]
                                          terminal chat with the running local API (key from $HUB_API_KEY or a
-                                         hidden prompt); Ctrl-C stops a reply, at the prompt it ends the chat
+                                         hidden prompt); Ctrl-C stops a reply, at the prompt it ends the chat.
+                                         --max-tokens N: longer replies, up to the server's --max-output-tokens
+                                         (without it the server's default applies; a cut reply is marked)
   history status | on | off | retention <days|none> | list | show <id> | delete <id> --yes
   workspace list | create <name> [--quota-mb N] | files <ws>
   workspace put <ws> <file> [--as REL] [--overwrite] | get <ws> <rel> <dest> [--overwrite]
@@ -51,8 +56,19 @@ macro_rules! say_err {
     ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr(), $($t)*); }};
 }
 
+/// The usage text, with the gateway's current token defaults filled in.
+fn usage() -> String {
+    let d = GatewayConfig::default();
+    USAGE_TEXT
+        .replace("{MAX_OUT}", &d.max_output_tokens.to_string())
+        .replace("{DEFAULT_OUT}", &d.default_output_tokens.to_string())
+}
+
+/// Bounds of `serve --max-output-tokens`.
+const MAX_OUTPUT_TOKENS: i64 = 32_768;
+
 fn usage_error(msg: impl std::fmt::Display) -> anyhow::Error {
-    anyhow!("{msg}\n\n{USAGE}")
+    anyhow!("{msg}\n\n{}", usage())
 }
 
 /// The arguments not consumed yet. A command takes the flags and words it knows, then calls
@@ -264,7 +280,7 @@ async fn run() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     // Help wins wherever it appears and has no side effects (`purge --help` must not purge).
     if raw.is_empty() || raw[0] == "help" || raw.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
+        println!("{}", usage());
         return Ok(());
     }
     let mut args = Args(raw);
@@ -273,7 +289,7 @@ async fn run() -> Result<()> {
     let db_path = dir.join("hub.db");
     // Every arm parses all of its arguments before touching the data directory.
     match cmd.as_str() {
-        "help" => println!("{USAGE}"),
+        "help" => println!("{}", usage()),
         "init" => {
             args.finish()?;
             for d in ["", "workspaces", "exports", "cache", "logs", "secrets"] {
@@ -454,7 +470,7 @@ async fn run() -> Result<()> {
                 return Err(usage_error("only `secret set tunnel_token` is supported"));
             }
             let mut intr = local::Interrupt::new()?;
-            let v = local::read_secret_line("tunnel token (typing is hidden): ", &mut intr).await?;
+            let v = local::read_secret_line(&local::TUNNEL_TOKEN_PROMPT, &mut intr).await?;
             let v = v.trim();
             if v.is_empty() {
                 bail!("no token on stdin; nothing stored");
@@ -503,6 +519,8 @@ struct ServeOpts {
     port: u16,
     max_active: usize,
     startup_timeout: Duration,
+    /// The gateway's cap on a reply and the engine's `--max-tokens`, kept equal.
+    max_output_tokens: u32,
     share: Option<ShareOpts>,
 }
 
@@ -527,6 +545,10 @@ impl ServeOpts {
             Some(v) => bounded("--startup-timeout", &v, 1, 86_400)? as u64,
             None => 900,
         };
+        let max_output_tokens = match args.value("--max-output-tokens")? {
+            Some(v) => bounded("--max-output-tokens", &v, 1, MAX_OUTPUT_TOKENS)? as u32,
+            None => GatewayConfig::default().max_output_tokens,
+        };
         let share = args.switch("--share");
         let consent = args.switch("--i-authorize-public-sharing");
         let cloudflared = args.value("--cloudflared")?;
@@ -548,6 +570,7 @@ impl ServeOpts {
             port,
             max_active,
             startup_timeout: Duration::from_secs(startup_timeout),
+            max_output_tokens,
             share,
         })
     }
@@ -682,7 +705,9 @@ async fn serve(dir: &Path, db_path: &Path, o: ServeOpts) -> Result<()> {
         port: 0,
         internal_key: internal.clone(),
         startup_timeout: o.startup_timeout,
-        max_tokens: 1024,
+        // The engine caps replies itself too; the same limit as the gateway, so neither one
+        // cuts a reply the other allows.
+        max_tokens: o.max_output_tokens,
     });
     say!("starting engine for {} ...", model_dir.display());
     let started = tokio::select! {
@@ -699,6 +724,7 @@ async fn serve(dir: &Path, db_path: &Path, o: ServeOpts) -> Result<()> {
                     model_id: o.model_id,
                     db_path: db_path.to_path_buf(),
                     max_active: o.max_active,
+                    max_output_tokens: o.max_output_tokens,
                     ..Default::default()
                 };
                 serve_ready(&engine, &mut shutdown, gw, internal, share).await
@@ -746,12 +772,20 @@ async fn serve_ready(
     share: Option<(CloudflaredTunnel, String)>,
 ) -> Result<()> {
     let model_id = cfg.model_id.clone();
+    let (max_out, default_out) = (
+        cfg.max_output_tokens,
+        cfg.default_output_tokens.min(cfg.max_output_tokens),
+    );
     let gw = Gateway::start(cfg, internal)
         .await
         .context("could not start the local API")?;
     say!(
         "local API ready:  http://{}/v1   model id: {model_id}   (auth: Bearer <key>)",
         gw.addr
+    );
+    say!(
+        "replies: up to {max_out} tokens (--max-output-tokens); {default_out} when a request \
+         sets no max_tokens"
     );
     let mut tunnel = None;
     let started = match share {
