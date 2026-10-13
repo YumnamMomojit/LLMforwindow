@@ -29,6 +29,8 @@ Facts to check before relying on it (I could not read Cloudflare's docs directly
   The gateway therefore sends response headers immediately for streams, then a `: keepalive` SSE comment every 15 s (`keepalive_secs`;
   the first one 15 s after the request) until the first token. **Non-streaming** requests with
   >100 s prefill will fail via Cloudflare → use `stream:true` for long prompts. Whether comments keep a *tunnel* connection alive was not tested.
+* The gateway closes every connection after its response (no HTTP keep-alive), so cloudflared opens a new local connection per request
+  and never reuses one the gateway is closing (a POST lost that way would not be retried).
 * Upload size limits (plans differ) are far above the Hub's 1 MiB body cap.
 * Quick Tunnels (`trycloudflare.com`) are random, ephemeral, and documented as not for production; the Hub does not use them.
 * Cloudflare terminates TLS and can see prompts and outputs. "Local inference" does not mean data never leaves the machine when shared.

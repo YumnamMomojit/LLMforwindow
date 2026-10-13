@@ -4,9 +4,13 @@
 #   dist/LocalAIHub-<ver>-linux-x64.tar.gz  (hubd)
 # Needs: rustup target x86_64-pc-windows-gnu, x86_64-w64-mingw32-gcc, cargo-about (--features cli).
 # The Colibri engine and Python are NOT bundled: the user adds the official release (README-FIRST.txt).
-# Reproducible: the same commit and toolchain give the same archives, wherever and whenever they are built.
-# Every date is the commit's (SOURCE_DATE_EPOCH), build paths are remapped out of the binaries, the
-# Windows linker writes no timestamp, and archive entries have fixed order, owners, modes and times.
+# Reproducible: the same commit and toolchain (rustc, mingw-w64) give the same archives, whatever the checkout
+# path, the target directory or the time of the build. Every date is the commit's (SOURCE_DATE_EPOCH); the
+# checkout, target, cargo and rustup paths are remapped out of the binaries; the Windows linker writes no
+# timestamp and the symbol table is stripped (it carries rustc temp-dir names); archive entries have fixed
+# order, owners, modes and times.
+# hubd is always relinked here and copied from the path cargo reports for this very build, so a binary left
+# over from an earlier build (another CARGO_TARGET_DIR or build.target-dir) is never shipped.
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 umask 022
@@ -14,20 +18,58 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 OUT="$ROOT/dist"
+WIN=x86_64-pc-windows-gnu LINUX=x86_64-unknown-linux-gnu
 command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "missing x86_64-w64-mingw32-gcc"; exit 1; }
 cargo about --version >/dev/null 2>&1 || { echo "missing cargo-about (cargo install cargo-about --locked --features cli)"; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "working tree not clean; commit first so BUILDINFO names the real source"; exit 1; }
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
-
-# Rust flags for these builds only (this replaces any RUSTFLAGS of the environment); \x1f-separated so
-# that paths with spaces survive.
-flags() { local IFS=$'\x1f'; echo "$*"; }
-REMAP=("--remap-path-prefix=$ROOT=/build/local-ai-hub" "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo")
-CARGO_ENCODED_RUSTFLAGS="$(flags "${REMAP[@]}" -C link-arg=-Wl,--no-insert-timestamp)" \
-  cargo build --release --locked -p hubd --target x86_64-pc-windows-gnu
-CARGO_ENCODED_RUSTFLAGS="$(flags "${REMAP[@]}")" cargo build --release --locked -p hubd
-rm -rf "$OUT"; mkdir -p "$OUT"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# Where cargo really writes (CARGO_TARGET_DIR, build.target-dir), not an assumed ./target.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps --locked | python3 -I -c \
+  'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+# Rust flags for these builds only (this replaces any RUSTFLAGS of the environment); \x1f-separated so
+# that paths with spaces survive. With several matching prefixes rustc uses the last one: the target
+# directory, often inside the checkout, comes last.
+flags() { local IFS=$'\x1f'; echo "$*"; }
+REMAP=("--remap-path-prefix=$ROOT=/build/local-ai-hub"
+       "--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+       "--remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
+       "--remap-path-prefix=$TARGET_DIR=/target")
+
+# build <triple> <rustflags...>: relink hubd for <triple> and set EXE to the executable cargo reports.
+build() {
+  local triple=$1; shift
+  local rf; rf="$(flags "$@")"
+  # Only hubd's own artifacts: the dependencies stay cached, but hubd is compiled and linked again.
+  cargo clean --release -p hubd --target "$triple" --quiet
+  : > "$TMP/stamp"
+  CARGO_ENCODED_RUSTFLAGS="$rf" cargo build --release --locked -p hubd --target "$triple" \
+    --message-format=json-render-diagnostics > "$TMP/cargo.json"
+  EXE=$(python3 -I - "$TMP/cargo.json" <<'PY'
+import json, sys
+found = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    t = m.get("target") or {}
+    if m.get("reason") == "compiler-artifact" and t.get("name") == "hubd" and "bin" in t.get("kind", ()) \
+            and m.get("executable"):
+        found.append((m["executable"], m.get("fresh")))
+if len(found) != 1 or found[0][1] is not False:
+    sys.exit(f"cargo did not report one freshly built hubd executable: {found}")
+print(found[0][0])
+PY
+)
+  [ -f "$EXE" ] && [ "$EXE" -nt "$TMP/stamp" ] || { echo "$EXE is missing or older than this build"; exit 1; }
+}
+build "$WIN" "${REMAP[@]}" -C link-arg=-Wl,--no-insert-timestamp -C strip=symbols
+WIN_EXE="$TMP/hubd.exe"; cp "$EXE" "$WIN_EXE"
+build "$LINUX" "${REMAP[@]}"
+LINUX_EXE="$TMP/hubd"; cp "$EXE" "$LINUX_EXE"
+rm -rf "$OUT"; mkdir -p "$OUT"
 cargo about generate --locked -c packaging/about.toml -m crates/hubd/Cargo.toml packaging/about.hbs -o "$TMP/THIRD-PARTY-LICENSES.txt"
 
 crlf() { sed 's/\r$//; s/$/\r/' "$1" > "$2"; }   # Notepad-friendly text in the Windows bundle
@@ -39,13 +81,13 @@ stage() { # stage <dir> <os>
   cp docs/*.md "$d/docs/"
   cp LICENSE NOTICE "$d/"
   if [ "$os" = windows ]; then
-    cp target/x86_64-pc-windows-gnu/release/hubd.exe "$d/"
+    cp "$WIN_EXE" "$d/hubd.exe"
     crlf packaging/hub.cmd "$d/hub.cmd"   # cmd.exe misreads labels in LF-only batch files
     crlf packaging/README-FIRST.txt "$d/README-FIRST.txt"
     crlf "$TMP/THIRD-PARTY-LICENSES.txt" "$d/THIRD-PARTY-LICENSES.txt"
     printf 'Unzip the official Colibri v2.0.0 Windows release here (see README-FIRST.txt, step 2).\r\n' > "$d/colibri/PUT-COLIBRI-HERE.txt"
   else
-    cp target/release/hubd "$d/"
+    cp "$LINUX_EXE" "$d/hubd"
     cp "$TMP/THIRD-PARTY-LICENSES.txt" "$d/"
     printf 'Put a Colibri v2.0.0 checkout or release here, then: ./hubd ... --colibri-dir colibri (see docs/WINDOWS.md and README.md).\n' > "$d/colibri/PUT-COLIBRI-HERE.txt"
     cp README.md "$d/"
@@ -54,7 +96,7 @@ stage() { # stage <dir> <os>
     echo "Local AI Hub $VER ($os x64)"
     echo "source commit: $(git rev-parse HEAD)"
     echo "source date: $(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ); built with $(rustc --version)"
-    echo "target: $([ "$os" = windows ] && echo x86_64-pc-windows-gnu || echo x86_64-unknown-linux-gnu)"
+    echo "target: $([ "$os" = windows ] && echo "$WIN" || echo "$LINUX")"
     echo "Colibri pin: v2.0.0 bf2442915d6e3dd4cdfd2eb9c2a3d2aa44a25850 (not included)"
     echo "code signing: none (unsigned)"
   } | { if [ "$os" = windows ]; then sed 's/$/\r/'; else cat; fi; } > "$d/BUILDINFO.txt"

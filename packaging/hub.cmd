@@ -8,10 +8,20 @@ rem Delayed expansion stays off even if the registry turns it on: it would eat e
 rem path or argument (--system "Be brief!").
 setlocal EnableExtensions DisableDelayedExpansion
 set "HUB_HOME=%~dp0"
+set "HUB_SKIPPED_PTH="
 
 if defined HUB_PYTHON goto :have_python
-if exist "%HUB_HOME%python\python.exe" set "HUB_PYTHON=%HUB_HOME%python\python.exe"
+rem A python folder next to hub.cmd is used only when it holds a full install. The embeddable
+rem package has a python3XX._pth file beside python.exe, which keeps openai_server.py from
+rem importing the files next to it, so the engine could not start. pushd + a bare pattern instead
+rem of a quoted "path\*" set, which some cmd implementations do not expand.
+if not exist "%HUB_HOME%python\python.exe" goto :find_python
+pushd "%HUB_HOME%python"
+for %%F in (*._pth) do set "HUB_SKIPPED_PTH=%%F"
+popd
+if not defined HUB_SKIPPED_PTH set "HUB_PYTHON=%HUB_HOME%python\python.exe"
 if defined HUB_PYTHON goto :have_python
+:find_python
 rem The py launcher first; a bare "python" can be the Microsoft Store stub, which prints nothing.
 for /f "usebackq delims=" %%P in (`py -3 -c "import sys; assert sys.version_info >= (3, 10); print(sys.executable)" 2^>nul`) do set "HUB_PYTHON=%%P"
 if defined HUB_PYTHON goto :have_python
@@ -24,8 +34,7 @@ if exist "%HUB_HOME%colibri\openai_server.py" set "HUB_COLIBRI_DIR=%HUB_HOME%col
 if defined HUB_COLIBRI_DIR goto :have_colibri
 if exist "%HUB_HOME%colibri\c\openai_server.py" set "HUB_COLIBRI_DIR=%HUB_HOME%colibri"
 if defined HUB_COLIBRI_DIR goto :have_colibri
-rem Unzipped with its own top-level folder: colibri\<folder>\openai_server.py. pushd + a bare *
-rem pattern instead of a quoted "path\*" set, which some cmd implementations do not expand.
+rem Unzipped with its own top-level folder: colibri\<folder>\openai_server.py.
 if not exist "%HUB_HOME%colibri\" goto :have_colibri
 pushd "%HUB_HOME%colibri"
 for /d %%D in (*) do if exist "%%~fD\openai_server.py" set "HUB_COLIBRI_DIR=%%~fD"
@@ -57,12 +66,26 @@ goto :check_python
 :have_hubd
 echo   hubd.exe : "%HUB_HOME%hubd.exe"
 :check_python
+if not defined HUB_SKIPPED_PTH goto :check_python_found
+echo   note     : "%HUB_HOME%python\python.exe" is NOT used: it is the embeddable Python
+echo              (%HUB_SKIPPED_PTH%), which cannot run the engine. Delete that python folder.
+:check_python_found
 if not defined HUB_PYTHON goto :no_python
 echo   Python   : "%HUB_PYTHON%"
 rem Run it: a broken or too old Python would otherwise only fail when serving starts.
 "%HUB_PYTHON%" -c "import sys; assert sys.version_info >= (3, 10); print('             version ' + sys.version.split()[0])"
-if not errorlevel 1 goto :check_colibri
+if not errorlevel 1 goto :check_python_path
 echo              does NOT run, or is older than 3.10. README-FIRST.txt step 1.
+set "HUB_CHECK_FAILED=1"
+goto :check_colibri
+:check_python_path
+rem The engine's openai_server.py imports the files next to it, which needs the script's own
+rem folder on sys.path ('' for -c). A ._pth file (embeddable package) or PYTHONSAFEPATH drops it.
+"%HUB_PYTHON%" -c "import sys; sys.exit(sys.path[:1] != [''])"
+if not errorlevel 1 goto :check_colibri
+echo              cannot run the engine: it does not import a script's own folder (an
+echo              embeddable Python with a ._pth file, or PYTHONSAFEPATH is set). Install
+echo              Python from python.org instead. README-FIRST.txt step 1.
 set "HUB_CHECK_FAILED=1"
 goto :check_colibri
 :no_python

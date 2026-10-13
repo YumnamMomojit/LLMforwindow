@@ -33,8 +33,8 @@ Status legend: **Impl** = merged and used as-is; **Reuse** = usable with a wrapp
 | Engine families | **Impl** | `family_registry`: glm53, glm, inkling, kimi, olmoe, qwen36 (+Qwen3-Coder, Qwen3.8-27B), qwen38, deepseek_v4, deepseek_v41, mimo, qwen_image (image), laya, gliner_decide (decision). Hub chat supports **text chat families only**; image/decision families are rejected at model validation (`hubd model validate`/`add`) by design. |
 | Model format | **Impl** | HF-style dir: `config.json`, `tokenizer.json`, safetensors shards; some families need an upstream conversion/prep step ("By hand" table). **No GGUF serving** — not assumed. |
 | CPU backend | **Impl** | pure C; no GPU needed |
-| Vulkan backend | **Impl, Unverified here** | in Windows release; runtime-loaded; falls back to CPU without Vulkan |
-| CUDA | **Reuse, Unverified** | separate `-cuda.zip` for RTX 30/40/50 (CC ≥ 8.0) |
+| Vulkan backend | **Impl, Unverified here** | in Windows release; runtime-loaded; used only with `COLI_VULKAN=1` in the engine's environment (`coli start` sets it, the Hub does not: set it before `hubd serve`, see WINDOWS.md); without a device most engines continue on the CPU, the GLM engine exits |
+| CUDA | **Not used by the Hub** | separate `-cuda.zip` for RTX 30/40/50 (CC ≥ 8.0); upstream's launcher sets `COLI_CUDA`/`COLI_GPUS` and sizes the VRAM tier with its planner, which the Hub does not run |
 | AMD XDNA NPU | Opt-in, Unverified | not used by Hub |
 | Windows launcher | **Reuse** | `START-HERE.bat`/`coli setup`: interactive, may offer winget Python install, builds with MSYS2 if present. The Hub does **not** run it; it launches `openai_server.py` directly with an argv array. |
 | Model discovery/download | **Reuse, not wired** | `coli setup`/`setup_catalog.py` (HF resume). Hub v0 imports existing dirs; download UI deferred. |
@@ -46,6 +46,6 @@ Status legend: **Impl** = merged and used as-is; **Reuse** = usable with a wrapp
 | Open issues/PRs | not reviewed | no GitHub API access to the upstream repo from this session; only merged code at the pinned commit was used |
 
 ## Dependencies for end users (Windows)
-Python 3.10+ (bundle an embeddable distribution or require it), the upstream Windows release engines + `shaders\`,
+Python 3.10+ as a full install (the embeddable distribution's `._pth` keeps `openai_server.py` from importing its own folder), the upstream Windows release engines + `shaders\`,
 WebView2 (for the future Tauri shell; ships with Windows 11, Evergreen installer otherwise), a Vulkan-capable driver for GPU (optional).
 End users need no Git, Rust, Node or compiler.

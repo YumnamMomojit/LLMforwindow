@@ -13,6 +13,8 @@
    are dropped (accepted, ignored). Model must equal the served id.
 4. **No forwarded-header trust**: `X-Forwarded-*` is ignored; limits are per key, not per IP. Optional `allowed_hosts` Host check.
 5. **Keys**: `lah_<id>_<secret>`; secret 256-bit CSPRNG, shown once, only SHA-256 stored; expiry/revoke/rotate; scope `inference` only.
+   Revocation is a flag and ignores the clock; expiry and rotation grace periods follow the system clock. The upgrade to schema v3
+   decided once, by the clock at that moment, which old grace periods had ended (STORAGE.md).
 6. **Logs**: time, key id, model, status, outcome, queue/first-byte/total ms, upstream-reported usage. No prompts/completions.
    Engine/tunnel log tails are redacted of the internal key / tunnel token. Retention via `hubd purge` (30 days default for request log).
 7. **Filesystem**: all workspace I/O through `storage.rs` (component allowlist, Windows reserved names, ADS `:` rejected, symlink/reparse-point
