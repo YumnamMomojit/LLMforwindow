@@ -8,12 +8,16 @@ use std::time::{Duration, Instant};
 
 const KEY: &str = "internal-test-key-0123456789";
 
-/// FAKE_MODE (read from <state>/mode): ok | die_after_ready | silent | busy_once |
-/// engine_child (runs an engine process, as upstream does, and serves) | stubborn (launcher
-/// and engine survive SIGTERM, never ready). The last two write "<launcher> <engine>" pids
-/// to <state>/pids once the engine runs.
+/// FAKE_MODE (read from <state>/mode): ok | die_after_ready | leader_exits_first | silent |
+/// busy_once | engine_child (runs an engine process, as upstream does, and serves) | stubborn
+/// (launcher and engine survive SIGTERM, never ready). The last two write "<launcher>
+/// <engine>" pids to <state>/pids once the engine runs.
+/// die_after_ready and leader_exits_first serve and write the launcher pid to <state>/pids;
+/// once <state>/die exists they log a MemoryError, and once <state>/exit exists the launcher
+/// exits with status 3. In leader_exits_first its main thread ends at "die" already, so the
+/// process lives on in its other threads (a zombie in /proc that cannot be reaped yet).
 const FAKE_LAUNCHER: &str = r#"
-import argparse, json, os, signal, subprocess, sys, threading, time
+import argparse, ctypes, json, os, signal, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 p = argparse.ArgumentParser()
 for f in ("--model", "--host", "--model-id", "--max-tokens", "--engine"):
@@ -63,13 +67,10 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        if mode == "die_after_ready":
-            def die():
-                time.sleep(0.5)
-                print("MemoryError: the engine ran out of memory", file=sys.stderr, flush=True)
-                time.sleep(0.5)
-                os._exit(3)
-            threading.Thread(target=die, daemon=True).start()
+
+def wait_for(name):
+    while not os.path.exists(os.path.join(state, name)):
+        time.sleep(0.01)
 
 srv = HTTPServer((a.host, a.port), H)
 print(f"loading with key {key}", file=sys.stderr, flush=True)
@@ -78,6 +79,21 @@ if mode == "stubborn":
         time.sleep(1)
 if mode != "silent":
     print(f"OpenAI-compatible API listening on http://{a.host}:{a.port}/v1", file=sys.stderr, flush=True)
+if mode in ("die_after_ready", "leader_exits_first"):
+    with open(os.path.join(state, "pids.tmp"), "w") as f:
+        f.write(str(os.getpid()))
+    os.replace(os.path.join(state, "pids.tmp"), os.path.join(state, "pids"))
+    def end():
+        wait_for("exit")
+        os._exit(3)
+    threading.Thread(target=end, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    wait_for("die")
+    print("MemoryError: the engine ran out of memory", file=sys.stderr, flush=True)
+    if mode == "leader_exits_first":
+        ctypes.CDLL(None).pthread_exit(None)
+    while True:
+        time.sleep(1)
 srv.serve_forever()
 "#;
 
@@ -152,6 +168,61 @@ fn relative_to_cwd(p: &Path) -> PathBuf {
     rel.join(p.strip_prefix("/").unwrap())
 }
 
+/// Pid of the launcher, written by the die_after_ready and leader_exits_first modes.
+fn launcher_pid(state: &Path) -> u32 {
+    read(&state.join("pids"))
+        .trim()
+        .parse()
+        .expect("no pid from the fake launcher")
+}
+
+/// Polls state() until Failed; every other answer must be Ready.
+async fn wait_failed(e: &ColibriAdapter, launcher: u32) -> String {
+    let t0 = Instant::now();
+    loop {
+        match e.state() {
+            EngineState::Failed(m) => return m,
+            EngineState::Ready => {}
+            s => panic!("unexpected state {s:?}"),
+        }
+        if t0.elapsed() > Duration::from_secs(10) {
+            unsafe {
+                libc::kill(launcher as i32, libc::SIGKILL);
+            }
+            panic!("engine exit after Ready never reported: {:?}", e.state());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Lets the fake launcher log its MemoryError and waits until hubd has read it, then lets it
+/// exit, so the exit is reported with the actionable reason without any timing assumption.
+/// Polls state() all along: until "exit" the launcher is still serving (or, after
+/// leader_exits_first ended its main thread, cannot be reaped yet) and that is Ready.
+async fn die_then_exit(e: &ColibriAdapter, f: &Fixture, launcher: u32) {
+    std::fs::write(f.state.join("die"), "").unwrap();
+    let t0 = Instant::now();
+    while !e.log_tail().iter().any(|l| l.contains("MemoryError")) {
+        assert_eq!(e.state(), EngineState::Ready);
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "no MemoryError line"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for _ in 0..10 {
+        assert_eq!(e.state(), EngineState::Ready);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::write(f.state.join("exit"), "").unwrap();
+    let msg = wait_failed(e, launcher).await;
+    assert!(msg.contains("Not enough memory"), "{msg}");
+    // The launcher's own status (3), not a tree that shrank without one.
+    assert!(msg.contains("exit status: 3"), "{msg}");
+    assert!(msg.contains("[redacted]"), "log tail missing: {msg}");
+    assert!(!msg.contains(KEY), "internal key leaked: {msg}");
+}
+
 #[tokio::test]
 async fn exit_after_ready_is_reported_as_failed() {
     let Some(py) = python3() else {
@@ -168,25 +239,57 @@ async fn exit_after_ready_is_reported_as_failed() {
     e.start().await.unwrap();
     assert_eq!(e.state(), EngineState::Ready);
     assert!(e.upstream_url().is_some());
-    let t0 = Instant::now();
-    let msg = loop {
-        if let EngineState::Failed(m) = e.state() {
-            break m;
-        }
-        assert!(
-            t0.elapsed() < Duration::from_secs(10),
-            "engine exit after Ready never reported"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    assert!(msg.contains("Not enough memory"), "{msg}");
-    assert!(msg.contains("exit status"), "{msg}");
-    assert!(msg.contains("[redacted]"), "log tail missing: {msg}");
-    assert!(!msg.contains(KEY), "internal key leaked: {msg}");
+    die_then_exit(&e, &f, launcher_pid(&f.state)).await;
     // No key goes to a port the engine no longer holds.
     assert_eq!(e.upstream_url(), None);
     assert!(!e.health().await);
     assert!(matches!(e.state(), EngineState::Failed(_)));
+    e.stop().await;
+    assert_eq!(e.state(), EngineState::NotConfigured);
+}
+
+/// A launcher whose main thread has ended shows as a zombie in /proc, so the tree count no
+/// longer has it, but it cannot be reaped until its other threads end. It must not be taken
+/// for a tree that lost its engine (Failed without the exit status, and a launcher killed
+/// that was still serving): it is reported once it exits, with its own status. Here the
+/// state lasts until the test ends the process; a multi-threaded launcher passes through it
+/// for a moment whenever it exits.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn launcher_that_cannot_be_reaped_yet_is_reported_with_its_status() {
+    let Some(py) = python3() else {
+        eprintln!("skipped: python3 not on PATH");
+        return;
+    };
+    let f = fixture("leader_exits_first");
+    let mut e = ColibriAdapter::new(config(
+        py,
+        f.colibri.clone(),
+        f.model.clone(),
+        Duration::from_secs(30),
+    ));
+    e.start().await.unwrap();
+    let launcher = launcher_pid(&f.state);
+    assert!(alive(launcher));
+    std::fs::write(f.state.join("die"), "").unwrap();
+    let t0 = Instant::now();
+    while alive(launcher) {
+        assert_eq!(e.state(), EngineState::Ready);
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "main thread never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Its main thread is a zombie now, the process lives on and still serves.
+    assert!(Path::new(&format!("/proc/{launcher}")).exists());
+    for _ in 0..10 {
+        assert_eq!(e.state(), EngineState::Ready);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(e.health().await);
+    die_then_exit(&e, &f, launcher).await;
+    assert_eq!(e.upstream_url(), None);
     e.stop().await;
     assert_eq!(e.state(), EngineState::NotConfigured);
 }
@@ -227,15 +330,64 @@ async fn wait_dead(pids: &[u32]) {
     assert!(left.is_empty(), "engine processes survived: {left:?}");
 }
 
+/// A process outside the engine tree whose name in /proc/<pid>/stat is not UTF-8, as the
+/// kernel's 15-byte cut of a name like "ééééééééé" is. Killed on drop.
+#[cfg(target_os = "linux")]
+struct OddName(std::process::Child);
+
+#[cfg(target_os = "linux")]
+fn odd_name() -> OddName {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    let mut c = std::process::Command::new("sh")
+        .args(["-c", r"printf '\303' > /proc/$$/comm && echo ok && read x"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(c.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let c = OddName(c);
+    assert_eq!(line.trim(), "ok", "could not rename the process");
+    let stat = std::fs::read(format!("/proc/{}/stat", c.0.id())).unwrap();
+    assert!(std::str::from_utf8(&stat).is_err(), "name is UTF-8");
+    c
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OddName {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Upstream's launcher outlives its engine: when the engine is OOM-killed or crashes, it
 /// keeps answering /v1/models. That must still be reported, and the launcher stopped.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn engine_exit_after_ready_is_reported_while_the_launcher_lives() {
+    engine_exit_while_the_launcher_lives(false).await;
+}
+
+/// The same with a process on the host whose /proc entry is not UTF-8, for the whole run:
+/// the tree count must skip it, not give up (which left the engine Ready for good).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn engine_exit_is_reported_with_a_non_utf8_process_name_on_the_host() {
+    engine_exit_while_the_launcher_lives(true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn engine_exit_while_the_launcher_lives(odd_name_on_host: bool) {
     let Some(py) = python3() else {
         eprintln!("skipped: python3 not on PATH");
         return;
     };
+    let _odd = odd_name_on_host.then(odd_name);
     let f = fixture("engine_child");
     let mut e = ColibriAdapter::new(config(
         py,

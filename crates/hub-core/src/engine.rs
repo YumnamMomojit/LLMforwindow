@@ -71,9 +71,10 @@ pub struct ColibriAdapter {
     /// soon as the child is known to be gone, so the internal key is not sent to a port that
     /// something else may own.
     port: AtomicU16,
-    /// Live processes in the engine tree (launcher, engine) when it became Ready; 0 when not
-    /// known. Fewer later means a process of the tree died: upstream's launcher outlives its
-    /// engine and keeps answering /v1/models, so its own exit cannot be waited for.
+    /// Live processes in the engine tree (launcher, engine) when it became Ready, or at the
+    /// first count that worked after it; 0 while not known. Fewer later means a process of
+    /// the tree died: upstream's launcher outlives its engine and keeps answering /v1/models,
+    /// so waiting for the launcher's own exit is not enough.
     ready_tree: AtomicUsize,
     log_tail: Arc<Mutex<VecDeque<String>>>,
 }
@@ -299,16 +300,28 @@ impl InferenceAdapter for ColibriAdapter {
             let Some(c) = child.as_mut() else {
                 return cur;
             };
+            // Count first, then reap. A launcher that dies during the count (a /proc scan,
+            // milliseconds on a busy host) is no longer counted, but it is reaped right after
+            // with its own exit status, instead of being reported as a smaller tree without it.
+            let live = c.live_processes();
+            let ready_tree = self.ready_tree.load(Ordering::SeqCst);
             if let Some(status) = c.poll_exit() {
                 Some(Some(status))
-            } else if c
-                .live_processes()
-                .is_some_and(|n| n < self.ready_tree.load(Ordering::SeqCst))
-            {
+            } else if ready_tree == 0 {
+                // Not counted at Ready (the count failed then): this count is the baseline.
+                // Calls are serialized by the child lock, held here.
+                if let Some(n) = live {
+                    self.ready_tree.store(n, Ordering::SeqCst);
+                }
+                None
+            } else if live.is_some_and(|n| n < ready_tree) && c.has_exited() != Some(true) {
                 // A launcher without its engine answers nothing useful: stop the rest now.
                 c.kill_tree_now();
                 Some(None)
             } else {
+                // Whole, or the launcher itself is what is missing: it has exited but cannot be
+                // reaped yet (its other threads are still ending). The next call reaps it and
+                // reports its exit status.
                 None
             }
         };
@@ -450,7 +463,8 @@ impl ColibriAdapter {
                             }) {
                                 // Upstream prints the banner only once its engine is up, and
                                 // nothing else runs in the tree then: this is the tree that
-                                // must stay whole.
+                                // must stay whole. 0 if it cannot be counted now; state()
+                                // then takes the first count that works.
                                 let tree = self.child.get_mut().unwrap().as_ref();
                                 let tree = tree.and_then(|c| c.live_processes()).unwrap_or(0);
                                 self.ready_tree.store(tree, Ordering::SeqCst);

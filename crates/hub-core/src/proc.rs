@@ -94,6 +94,27 @@ impl OwnedChild {
         None
     }
 
+    /// Whether the direct child has exited (Linux), including before `poll_exit` can reap it:
+    /// a process whose main thread is gone shows as a zombie, and is counted as dead by
+    /// `live_processes`, but it can only be waited for once its last thread has exited too.
+    /// Some(true) once reaped. None where /proc cannot tell (other OSes, a failed read).
+    pub fn has_exited(&self) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(pid) = self.child.id() else {
+                return Some(true);
+            };
+            match std::fs::read(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat_fields(&stat).map(|(state, _)| !is_alive(state)),
+                // Not reaped, so the entry stays while it is a zombie: gone means dead.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
     /// SIGKILL the whole tree (Windows: terminate the job) without waiting. The direct child
     /// is left for `poll_exit` or `kill_tree` to reap.
     pub fn kill_tree_now(&self) {
@@ -140,9 +161,14 @@ impl Drop for OwnedChild {
     }
 }
 
-/// Processes of the group `pgid` that are alive (not zombies), from /proc. None on any error
-/// other than a process gone since the listing (out of file descriptors, say): a count that
-/// is too low would read as a dead engine.
+/// Processes of the group `pgid` that are alive (not zombies), from /proc.
+///
+/// Entries that cannot be ours are skipped: a process gone since the listing, and one this
+/// user may not look at (/proc mounted hidepid=noaccess, as systemd's ProtectProc=noaccess
+/// does: another user's process, which a tree of ours does not hold; a member that ran a
+/// setuid program or made itself undumpable would be hidden too, which upstream's launcher
+/// and engine do not do). Any other error (out of file descriptors or memory, say) gives
+/// None: a count that is too low would read as a dead engine.
 #[cfg(target_os = "linux")]
 fn group_members(pgid: u32) -> Option<usize> {
     let mut n = 0;
@@ -150,33 +176,53 @@ fn group_members(pgid: u32) -> Option<usize> {
         let name = e.ok()?.file_name();
         let Some(pid) = name
             .to_str()
-            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         else {
             continue;
         };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Bytes, not a String: comm is the kernel's raw, 15-byte cut of the program name and
+        // can end in the middle of a UTF-8 sequence.
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(s) => s,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                continue;
-            }
+            Err(e) if not_ours(&e) => continue,
             Err(_) => return None,
         };
-        // "pid (comm) state ppid pgrp ...": comm may hold spaces and ')'.
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            continue;
-        };
-        let mut f = rest.split_ascii_whitespace();
-        let (state, _ppid, pgrp) = (f.next(), f.next(), f.next());
-        if pgrp.and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
-            && !matches!(state, Some("Z" | "X" | "x"))
-        {
+        if stat_fields(&stat).is_some_and(|(state, pgrp)| pgrp == pgid && is_alive(state)) {
             n += 1;
         }
     }
     Some(n)
+}
+
+/// A /proc/<pid>/stat read failure that says the process is not one of ours.
+#[cfg(target_os = "linux")]
+fn not_ours(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOENT | libc::ESRCH | libc::EACCES | libc::EPERM)
+    )
+}
+
+/// (state, process group) from the bytes of /proc/<pid>/stat: "pid (comm) state ppid pgrp ...",
+/// where comm may hold spaces, ')' and bytes that are not UTF-8.
+#[cfg(target_os = "linux")]
+fn stat_fields(stat: &[u8]) -> Option<(u8, u32)> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let mut f = stat[close + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty());
+    let state = match f.next()? {
+        [s] => *s,
+        _ => return None,
+    };
+    let pgrp = std::str::from_utf8(f.nth(1)?).ok()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
+/// Not a zombie (Z) or dead (X, or x on old kernels).
+#[cfg(target_os = "linux")]
+fn is_alive(state: u8) -> bool {
+    !matches!(state, b'Z' | b'X' | b'x')
 }
 
 #[cfg(windows)]
@@ -243,5 +289,42 @@ mod win {
                 CloseHandle(self.0); // KILL_ON_JOB_CLOSE ends any survivors
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_with_a_comm_cut_inside_a_utf8_sequence_parses() {
+        // 'ééééééééé' cut at 15 bytes by the kernel ends in a lone 0xC3.
+        let mut stat = b"19605 (".to_vec();
+        stat.extend_from_slice(&"é".repeat(7).into_bytes());
+        stat.extend_from_slice(b"\xc3) Z 1 19604 19601 0 -1 4228108\n");
+        assert!(std::str::from_utf8(&stat).is_err());
+        assert_eq!(stat_fields(&stat), Some((b'Z', 19604)));
+    }
+
+    #[test]
+    fn stat_with_spaces_and_parens_in_comm_parses() {
+        let stat = b"42 (a) b (c)) S 1 4242 4242 0 -1 0\n";
+        assert_eq!(stat_fields(stat), Some((b'S', 4242)));
+        assert!(is_alive(b'S') && is_alive(b'D') && !is_alive(b'Z') && !is_alive(b'X'));
+        assert_eq!(stat_fields(b"42 (x)"), None);
+        assert_eq!(stat_fields(b"42 (x) S 1"), None);
+        assert_eq!(stat_fields(b"42 x S 1 2"), None);
+    }
+
+    #[test]
+    fn only_gone_or_hidden_entries_are_skipped() {
+        use std::io::Error;
+        for e in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
+            assert!(not_ours(&Error::from_raw_os_error(e)), "{e}");
+        }
+        for e in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EIO] {
+            assert!(!not_ours(&Error::from_raw_os_error(e)), "{e}");
+        }
+        assert!(!not_ours(&Error::from(std::io::ErrorKind::InvalidData)));
     }
 }
