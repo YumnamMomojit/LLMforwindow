@@ -437,15 +437,16 @@ async fn run() -> Result<()> {
                         .transpose()?;
                     let name = args.word("key name")?;
                     args.finish()?;
-                    let exp = days
-                        .map(|d| {
-                            d.checked_mul(86_400)
-                                .and_then(|s| semdok_core_now().checked_add(s))
-                                .context("expiry out of range")
-                        })
-                        .transpose()?;
                     let c = db::open(&db_path)?;
-                    let (rec, tok) = keys::create(&c, &name, exp)?;
+                    let (rec, tok) = match days {
+                        Some(d) => keys::create_with_lifetime(
+                            &c,
+                            &name,
+                            d.checked_mul(86_400).context("expiry out of range")?,
+                        )?,
+                        None => keys::create(&c, &name, None)?,
+                    };
+                    let exp = rec.expires_at;
                     println!(
                         "id:      {}\nname:    {}\nscopes:  {}\nexpires: {}\nsecret (shown once, store it now):\n{tok}",
                         rec.id,

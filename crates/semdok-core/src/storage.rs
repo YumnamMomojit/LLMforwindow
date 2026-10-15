@@ -399,9 +399,15 @@ pub fn resolve_in(root: &Path, comps: &[String]) -> R<PathBuf> {
             Err(e) => return Err(e.into()),
         }
     }
-    // Belt and braces: the deepest existing ancestor must canonicalise inside the root.
+    // Belt and braces: the deepest existing ancestor must canonicalise inside the root. It
+    // starts at the parent folder: every component was checked above, and canonicalising the
+    // file itself races an overwrite on Windows, where a file replaced while it is open
+    // resolves to its deleted copy under \$Extend\$Deleted, outside the root.
     let canon_root = root.canonicalize()?;
-    let mut probe = cur.clone();
+    let mut probe = match cur.parent() {
+        Some(p) if !comps.is_empty() => p.to_path_buf(),
+        _ => cur.clone(),
+    };
     while !probe.exists() {
         if !probe.pop() {
             break;

@@ -55,16 +55,41 @@ pub fn create(
     name: &str,
     expires_at: Option<i64>,
 ) -> anyhow::Result<(KeyRecord, String)> {
+    if expires_at.is_some_and(|e| e <= now()) {
+        anyhow::bail!("expiry must be in the future");
+    }
+    create_inner(c, name, expires_at, now())
+}
+
+/// Like [`create`], with the expiry given as a lifetime counted from the key's own creation
+/// time, so `created_at` and `expires_at` are exactly `lifetime_secs` apart.
+pub fn create_with_lifetime(
+    c: &Connection,
+    name: &str,
+    lifetime_secs: i64,
+) -> anyhow::Result<(KeyRecord, String)> {
+    if lifetime_secs <= 0 {
+        anyhow::bail!("expiry must be in the future");
+    }
+    let created = now();
+    let exp = created
+        .checked_add(lifetime_secs)
+        .ok_or_else(|| anyhow::anyhow!("expiry out of range"))?;
+    create_inner(c, name, Some(exp), created)
+}
+
+fn create_inner(
+    c: &Connection,
+    name: &str,
+    expires_at: Option<i64>,
+    created: i64,
+) -> anyhow::Result<(KeyRecord, String)> {
     let name = name.trim();
     if name.is_empty() || name.len() > 80 || name.chars().any(|ch| ch.is_control()) {
         anyhow::bail!("key name must be 1-80 printable characters");
     }
-    if expires_at.is_some_and(|e| e <= now()) {
-        anyhow::bail!("expiry must be in the future");
-    }
     let id = hex::encode(random_bytes::<4>());
     let secret = URL_SAFE_NO_PAD.encode(random_bytes::<32>());
-    let created = now();
     c.execute(
         "INSERT INTO api_keys(id,name,verifier,scopes,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
         params![id, name, verifier(&secret), SCOPE_INFERENCE, created, expires_at],
