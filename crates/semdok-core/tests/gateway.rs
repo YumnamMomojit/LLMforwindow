@@ -1000,8 +1000,11 @@ async fn keyless_clients_cannot_lock_out_a_key_holder() {
         keyless_401s.load(SeqCst) > 20,
         "the keyless clients were not running"
     );
+    // Locked out, the key holder gets about 2 of 20 (measured with eviction disabled). With
+    // eviction it got 20/20 on Linux and 17-18/20 on GitHub's Windows runners, where loopback
+    // connects are slower and an occasional request still meets a full table.
     assert!(
-        served >= 19,
+        served >= 15,
         "the key holder was served {served} of 20 times"
     );
 }

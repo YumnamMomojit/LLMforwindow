@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
       - run: cargo clippy --workspace --all-targets
   real-engine-fixture:   # real upstream engine + random-weight fixture; Linux only
     runs-on: ubuntu-latest
@@ -37,3 +37,25 @@ jobs:
           name: SemdokEdge-bundles
           path: dist/
           if-no-files-found: error
+  windows-e2e:   # the shipped bundle on a real Windows machine with the official Colibri release
+    needs: bundle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install numpy pillow
+      - uses: actions/download-artifact@v4
+        with: { name: SemdokEdge-bundles, path: dist }
+      - name: Get Colibri v2.0.0 (source for the test model, official Windows release)
+        shell: pwsh
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          git -c core.longpaths=true clone -q --depth 1 --branch v2.0.0 https://github.com/JustVugg/colibri "$env:RUNNER_TEMP\colibri-src"
+          gh release view v2.0.0 -R JustVugg/colibri --json assets --jq '.assets[].name'
+          gh release download v2.0.0 -R JustVugg/colibri -p 'colibri-v2.0.0-windows-x86_64.zip' -D "$env:RUNNER_TEMP"
+      - name: End-to-end
+        shell: pwsh
+        run: |
+          $zip = (Get-Item dist\SemdokEdge-*-windows-x64.zip).FullName
+          ./scripts/windows_e2e.ps1 -BundleZip $zip -ColibriZip "$env:RUNNER_TEMP\colibri-v2.0.0-windows-x86_64.zip" -ColibriSrc "$env:RUNNER_TEMP\colibri-src"
